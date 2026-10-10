@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS channels (
   id INTEGER PRIMARY KEY,
   code TEXT NOT NULL UNIQUE,
   name TEXT NOT NULL,
-  kind TEXT NOT NULL DEFAULT 'simulated',   -- simulated | channex
+  kind TEXT NOT NULL DEFAULT 'simulated',   -- simulated | channex | direct
   config TEXT,                               -- JSON, provider settings
   enabled INTEGER NOT NULL DEFAULT 1,
   -- OTAs charge commission, so hotels usually sell a little higher there.
@@ -105,6 +105,8 @@ CREATE TABLE IF NOT EXISTS bookings (
   status TEXT NOT NULL DEFAULT 'confirmed',  -- confirmed | cancelled
   overbooked INTEGER NOT NULL DEFAULT 0,
   needs_attention TEXT,                      -- e.g. a room we couldn't map
+  notes TEXT,
+  handled_at TEXT,                           -- staff dealt with the overbooking / attention flag
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE (channel_id, external_ref)
@@ -118,6 +120,32 @@ CREATE TABLE IF NOT EXISTS booking_lines (
   check_in TEXT NOT NULL,
   check_out TEXT NOT NULL,
   rooms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  name TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- Only a hash of the session token is stored, so a leaked database can't be
+-- used to log in.
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+-- Who changed what, for the "Recent changes" list.
+CREATE TABLE IF NOT EXISTS activity (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  user_name TEXT,
+  action TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 
 -- Provider booking revisions already applied, so a re-delivered one is not
@@ -148,6 +176,8 @@ function migrateAfter(db) {
   addColumn('channels', 'kind', "TEXT NOT NULL DEFAULT 'simulated'");
   addColumn('channels', 'config', 'TEXT');
   addColumn('channel_room_mappings', 'external_rate_plan_id', 'TEXT');
+  addColumn('bookings', 'notes', 'TEXT');
+  addColumn('bookings', 'handled_at', 'TEXT');
 
   const hasV1 = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bookings_v1'").get();
   if (hasV1) {
@@ -176,16 +206,14 @@ const SEED_CHANNELS = [
   { code: 'expedia', name: 'Expedia', prefix: 'EXP', markup: 18 },
 ];
 
-function seed(db) {
-  const hasRooms = db.prepare('SELECT COUNT(*) AS n FROM room_types').get().n > 0;
-  if (hasRooms) return;
-
-  db.prepare('INSERT INTO property (id, name, currency) VALUES (1, ?, ?)').run('Demo Hotel', 'INR');
+/** Fill an empty hotel with sample rooms and four simulated OTAs to try things out. */
+function seedDemo(db) {
+  if (db.prepare('SELECT COUNT(*) AS n FROM room_types').get().n > 0) return;
   const insRoom = db.prepare(
     'INSERT INTO room_types (code, name, total_rooms, base_rate) VALUES (?, ?, ?, ?)'
   );
   const insChannel = db.prepare(
-    'INSERT INTO channels (code, name, rate_markup_pct) VALUES (?, ?, ?)'
+    "INSERT INTO channels (code, name, kind, rate_markup_pct) VALUES (?, ?, 'simulated', ?)"
   );
   const insMap = db.prepare(
     'INSERT INTO channel_room_mappings (channel_id, room_type_id, external_room_id) VALUES (?, ?, ?)'
@@ -195,11 +223,12 @@ function seed(db) {
     (r) => ({ ...r, id: Number(insRoom.run(r.code, r.name, r.total_rooms, r.base_rate).lastInsertRowid) })
   );
   for (const c of SEED_CHANNELS) {
+    if (db.prepare('SELECT 1 FROM channels WHERE code = ?').get(c.code)) continue;
     const channelId = Number(insChannel.run(c.code, c.name, c.markup).lastInsertRowid);
     for (const r of roomIds) insMap.run(channelId, r.id, `${c.prefix}-${r.code}`);
+    // Give every OTA the starting rates and availability.
+    queueFullResync(db, channelId);
   }
-  // Give every OTA the starting rates and availability.
-  for (const { id } of db.prepare('SELECT id FROM channels').all()) queueFullResync(db, id);
 }
 
 function openDb(file = ':memory:') {
@@ -210,7 +239,10 @@ function openDb(file = ':memory:') {
     migrateBefore(db);
     db.exec(SCHEMA);
     migrateAfter(db);
-    seed(db);
+    // Bookings taken by phone or at the desk. Never pushed anywhere itself;
+    // it only takes rooms out of what the OTAs can sell.
+    db.prepare(`INSERT OR IGNORE INTO channels (code, name, kind, enabled)
+                VALUES ('direct', 'Direct / walk-in', 'direct', 1)`).run();
   });
   return db;
 }
@@ -235,4 +267,4 @@ function transaction(db, fn) {
   }
 }
 
-module.exports = { openDb, transaction };
+module.exports = { openDb, transaction, seedDemo };

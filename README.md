@@ -9,15 +9,38 @@ automatically, so you don't get overbooked.
 
 ## What it does
 
-| Feature | How |
-|---|---|
-| **One-click bulk update** | Pick room types, a date range and (optionally) weekdays, then set rate, rooms available, minimum stay or stop-sell. Press **Update all channels**. |
-| **Close out / reopen** | One button stops (or restarts) sales for the selected rooms and dates on every OTA. |
-| **Calendar** | Two-week grid per room type. Click any night to edit it. Closed or sold-out nights show in red. |
-| **Per-channel pricing** | Each OTA has a markup % (to cover its commission). You enter one base rate; Booking.com might get +15%, MakeMyTrip +12%. |
-| **Booking sync** | OTAs post bookings and cancellations to a webhook. Availability is lowered or restored in the shared pool and pushed to every channel. Duplicate webhooks are ignored. A booking for nights that were already full is flagged **Overbooked**. |
-| **Reliable delivery** | Every change goes into a sync queue. If an OTA's API is down, its updates are retried with backoff while the other channels carry on. Failed updates can be retried with one click. |
-| **"What guests see"** | For each OTA, a view of what it currently shows next to what it should show, with ✓ when they match. |
+**Calendar**
+- **One-click update:** pick room types, a date range and optionally
+  weekdays, then set the rate, rooms available, minimum stay or stop-sell.
+  Press **Update all channels**.
+- **Close out / reopen:** stop or restart sales for the selected rooms and
+  dates on every OTA with one button.
+- **Calendar grid:** two weeks per room type. Click any night to edit it.
+  Closed, sold-out and overbooked nights show in red.
+- **Recent changes:** who changed what, and when.
+
+**Bookings**
+- **OTA bookings arrive by themselves** (through Channex). New, changed and
+  cancelled bookings update the calendar, and the new availability goes back
+  out to every OTA.
+- **Direct bookings** for phone, email and walk-in guests. The rooms come
+  off every OTA straight away. They're refused if the rooms aren't free.
+- **Overbooking alerts:** if an OTA confirms a guest for a night that was
+  already full, a red banner stays up until someone marks it handled.
+- **Lists:** upcoming stays, arrivals today, needs attention, past and
+  cancelled, with search.
+
+**Channels**
+- **Connect real OTAs through Channex.** See below.
+- **Reliable delivery:** changes are queued, batched and retried. If one
+  channel is down, the others carry on. The header shows whether everything
+  is in sync.
+- **Per-channel price markup**, and four demo OTAs you can use to try
+  everything before connecting real ones.
+
+**Settings**
+- Hotel name and currency, room types (add, edit, delete), user accounts
+  and passwords.
 
 ## Run it
 
@@ -29,36 +52,43 @@ npm start          # http://localhost:3000
 npm test
 ```
 
-Data is stored in `data/channel-manager.db`. Settings go in a `.env` file (see `.env.example`).
-On first start it creates a demo hotel: 3 room types and 4 simulated OTAs.
-To reach the real OTAs, connect Channex as described below.
+On first start the app asks for your hotel name, currency and an owner
+account. Tick **Add demo rooms and OTAs** to try it with sample data, or
+leave it unticked and add your own room types in **Settings**.
 
-**Try it:**
-1. Set a new rate for next weekend and press **Update all channels**. Then open **View on Agoda** and check the new price (with markup) is there.
-2. Open **Simulate a booking**, book 2 Suites on Booking.com, and check that MakeMyTrip, Agoda and Expedia now show the Suite as closed.
-3. Tick **Simulate API outage** on Expedia and make a change. Expedia shows *Retrying* while the other channels update. Untick it and Expedia catches up.
+Data is stored in `data/channel-manager.db`. Settings go in a `.env` file
+(see `.env.example`).
+
+**Things to try with the demo data:**
+1. Set a new rate for next weekend and press **Update all channels**. On
+   **Channels**, open **View on Agoda** and check the new price (with
+   markup) is there.
+2. On **Bookings**, open *Demo: simulate a booking*. Book 2 Suites on
+   Agoda, then 1 more on Expedia for the same night. The overbooking alert
+   appears.
+3. Tick **Simulate API outage** on Expedia and make a change. Expedia shows
+   *Retrying* while the other channels update. Untick it and Expedia
+   catches up.
 
 ## How it's built
 
 ```
 src/
-  db.js              SQLite schema + demo seed
+  server.js          starts the app (reads .env settings)
+  app.js             security headers, login gate, mounts the routes
+  routes/            the HTTP API, one file per area
+  auth.js            passwords (scrypt), sessions, login lockout
+  hotel.js           hotel details and room types
+  db.js              SQLite schema, upgrades from older versions, demo data
   inventory.js       the calendar (single source of truth) and bulk updates
-  bookings.js        incoming bookings / cancellations from OTAs
-  queue.js           marks changed cells as "needs pushing" per channel
-  sync.js            background worker that pushes queued cells to each channel
-  channels/
-    base.js          the interface every connection implements
-    channex.js       sends the calendar to Channex (ranges, rate plans)
-    simulated.js     a fake OTA used for the demo
-    index.js         picks the adapter for a channel
-  providers/channex/
-    client.js        Channex API client (auth, errors, pagination)
-    index.js         connect / map rooms / pull bookings
-    revisions.js     applies a Channex booking revision to the calendar
-  app.js             REST API + serves the dashboard
+  bookings.js        bookings from OTAs and direct; overbooking detection
+  activity.js        "who changed what" log
+  queue.js           marks changed nights as "needs pushing" per channel
+  sync.js            background worker that pushes queued nights to each channel
+  channels/          one adapter per kind of connection (Channex, demo OTA)
+  providers/channex/ Channex API client, connect/mapping, booking revisions
 public/              dashboard (plain HTML/CSS/JS, no build step)
-test/                end-to-end API tests
+test/                end-to-end tests, plus a fake Channex API
 ```
 
 The queue stores *which* cells changed, not their values. The worker reads the
@@ -68,21 +98,34 @@ earlier, slower push.
 
 ### API
 
+Everything under `/api` needs a logged-in session cookie, except
+`/api/health`, `/api/session`, `/api/setup`, `/api/auth/login` and the
+Channex webhook. Requests that change something must send the header
+`X-Requested-With: channel-manager`.
+
 | Method | Path | Purpose |
 |---|---|---|
+| GET | `/api/session` | Setup needed? Who is logged in? |
+| POST | `/api/setup` | First run only: `{hotel_name, currency, name, email, password, demo?}` |
+| POST | `/api/auth/login` · `/api/auth/logout` · `/api/auth/password` | Log in / out, change password |
+| GET, POST, DELETE | `/api/users` · `/api/users/:id` | Manage users |
+| GET, PATCH | `/api/property` | Hotel name and currency |
+| GET, POST, PATCH, DELETE | `/api/room-types` · `/api/room-types/:id` | Room types `{code, name, total_rooms, base_rate}` |
 | GET | `/api/inventory?start=YYYY-MM-DD&days=14` | Calendar grid |
 | POST | `/api/inventory/bulk` | `{room_type_ids, start_date, end_date, weekdays?, set: {rate?, available?, min_stay?, stop_sell?}}` |
-| GET | `/api/channels` | Channels with sync status |
-| PATCH | `/api/channels/:code` | `{enabled?, rate_markup_pct?, simulate_outage?}` |
-| GET | `/api/channels/:code/listings` | What the OTA shows vs. what it should show |
-| POST | `/api/channels/:code/bookings` | Booking webhook: `{external_ref, room_id, check_in, check_out, rooms, guest_name?, total?}` |
-| POST | `/api/channels/:code/bookings/:ref/cancel` | Cancellation webhook |
-| GET | `/api/bookings` · `/api/sync/log` | Lists |
-| POST | `/api/sync/retry` | Retry failed pushes |
+| GET | `/api/bookings?view=upcoming\|arrivals\|attention\|past\|cancelled\|all&q=` | Bookings |
+| POST | `/api/bookings` | Direct booking `{room_type_id, check_in, check_out, rooms, guest_name, total?, notes?}` |
+| POST | `/api/bookings/:id/cancel` · `/api/bookings/:id/handled` | Cancel; mark an alert handled |
+| GET | `/api/alerts` · `/api/activity` | Banner alerts; recent changes |
+| GET, PATCH | `/api/channels` · `/api/channels/:code` | Channels and sync status; `{enabled?, rate_markup_pct?}` |
+| GET | `/api/channels/:code/listings` | What a demo OTA shows vs. what it should show |
+| GET, POST | `/api/sync/log` · `/api/sync/retry` | Sync history; retry failed pushes |
 | GET | `/api/providers/channex` | Connection status |
 | GET | `/api/providers/channex/properties` · `/properties/:id/rooms` | Channex properties, room types and rate plans |
 | POST | `/api/providers/channex/connect` | `{property_id, mappings: [{room_type_id, channex_room_type_id, channex_rate_plan_id}]}` |
-| POST | `/api/providers/channex/disconnect` · `/pull` · `/webhook` | Disconnect, check bookings now, Channex webhook |
+| POST | `/api/providers/channex/disconnect` · `/pull` | Disconnect; check for bookings now |
+| POST | `/api/providers/channex/webhook` | Called by Channex (shared-secret header, no login) |
+| GET | `/api/health` | For uptime checks |
 
 ## Going live with real OTAs, through Channex
 
@@ -170,9 +213,72 @@ way. Write an adapter in `src/channels/` (extend `ChannelAdapter` and
 implement `pushUpdates`), register it in `src/channels/index.js`, and feed
 its bookings to `applyReservation` in `src/bookings.js`.
 
-## Before production
+## Putting it online
 
-- Add login and access control. There is no authentication yet.
-- Verify webhook signatures and use HTTPS.
-- Support multiple properties and rate plans (e.g. room-only vs. breakfast included). Right now there is one hotel with one rate per room type.
-- Add alerts (email/WhatsApp) for overbookings and channels that keep failing.
+### With Docker
+
+```bash
+docker build -t channel-manager .
+docker run -d --name channel-manager -p 3000:3000 \
+  -v channel-manager-data:/data --env-file .env channel-manager
+```
+
+The database is stored in the `/data` volume. Back it up by copying
+`/data/channel-manager.db` while the app is stopped, or with
+`sqlite3 channel-manager.db ".backup backup.db"` while it runs.
+
+### Without Docker
+
+Any server with Node.js 22.13+: `npm ci --omit=dev && npm start`. Keep it
+running with systemd, pm2 or similar.
+
+### HTTPS (required)
+
+Never expose the app over plain HTTP: passwords and session cookies would
+travel unencrypted. Put it behind a reverse proxy that handles HTTPS
+(Caddy, nginx, or your hosting platform's built-in HTTPS), and set
+`TRUST_PROXY=1` so the app knows requests arrived over HTTPS and marks its
+cookies Secure. With Caddy, the whole config is:
+
+```
+hotel.example.com {
+    reverse_proxy localhost:3000
+}
+```
+
+### Settings (environment variables)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PORT` | `3000` | Port to listen on |
+| `DB_FILE` | `data/channel-manager.db` | Where the database is stored |
+| `TRUST_PROXY` | off | Set to `1` behind a reverse proxy |
+| `CHANNEX_API_KEY` | – | Your Channex API key; leave empty to run without Channex |
+| `CHANNEX_ENV` | `staging` | `staging` or `production` |
+| `CHANNEX_WEBHOOK_SECRET` | – | Shared secret for the Channex webhook (optional) |
+| `CHANNEX_POLL_SECONDS` | `60` | How often to check Channex for bookings |
+
+## Security
+
+- Passwords are hashed with scrypt. Sessions are random tokens, and only
+  their hashes are stored. Cookies are HttpOnly, SameSite=Strict, and
+  Secure behind HTTPS.
+- After 10 wrong passwords for an email or from an IP address, logins are
+  blocked for 15 minutes.
+- Requests that change data need a custom header, which blocks cross-site
+  request forgery. Strict Content-Security-Policy and anti-framing headers
+  are set.
+- Changing your password logs out your other devices. Removing a user logs
+  them out everywhere.
+
+## Not built yet
+
+- **Roles:** every user can do everything, including settings and the
+  Channex connection.
+- **Rate plans:** one price per room type per night. There's no separate
+  "room only" vs "with breakfast" price.
+- **Several hotels in one installation:** run one copy per hotel for now.
+- **Email/WhatsApp alerts:** alerts show in the dashboard only.
+- **Password reset by email:** for now, whoever runs the server resets it:
+  `npm run reset-password -- you@example.com 'new password'` (with Docker:
+  `docker exec channel-manager node scripts/reset-password.js you@example.com 'new password'`).

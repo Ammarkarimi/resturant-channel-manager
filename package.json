@@ -10,10 +10,11 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env --disable-warning=ExperimentalWarning src/server.js",
     "dev": "node --env-file-if-exists=.env --disable-warning=ExperimentalWarning --watch src/server.js",
-    "test": "node --disable-warning=ExperimentalWarning --test \"test/**/*.test.js\""
+    "test": "node --disable-warning=ExperimentalWarning --test \"test/**/*.test.js\"",
+    "reset-password": "node --env-file-if-exists=.env --disable-warning=ExperimentalWarning scripts/reset-password.js"
   },
   "license": "UNLICENSED",
   "dependencies": {
-    "express": "4.21.2"
+    "express": "4.22.3"
   }
 }

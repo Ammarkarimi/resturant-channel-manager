@@ -1,30 +1,15 @@
 const { test, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
-const { openDb } = require('../src/db');
-const { createApp } = require('../src/app');
+const { startApp } = require('./helpers');
 const { today, addDays } = require('../src/dates');
 
-let db; let engine; let server; let base;
+let db; let engine; let api; let close;
 
 beforeEach(async () => {
-  db = openDb(':memory:');
-  ({ app: server, engine } = createApp(db));
-  server = await new Promise((resolve) => {
-    const s = server.listen(0, () => resolve(s));
-  });
-  base = `http://127.0.0.1:${server.address().port}`;
+  ({ db, engine, api, close } = await startApp());
 });
 
-afterEach(() => new Promise((resolve) => server.close(resolve)));
-
-async function api(method, path, body) {
-  const res = await fetch(base + path, {
-    method,
-    headers: { 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  return { status: res.status, body: await res.json() };
-}
+afterEach(() => close());
 
 const D0 = addDays(today(), 3);
 

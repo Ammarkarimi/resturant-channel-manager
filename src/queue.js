@@ -25,14 +25,28 @@ function queueSync(db, roomTypeId, dates, channelId = null) {
   for (const date of dates) stmt.run(date, now, roomTypeId, channelId, channelId);
 }
 
+function horizonDates(kind) {
+  const days = HORIZON_BY_KIND[kind] || RESYNC_HORIZON_DAYS;
+  return eachDate(today(), addDays(today(), days - 1));
+}
+
 /** Push the next N days of every room type to one channel (used when a channel is (re)connected or its pricing changes). */
 function queueFullResync(db, channelId) {
   const { kind } = db.prepare('SELECT kind FROM channels WHERE id = ?').get(channelId);
-  const horizonDays = HORIZON_BY_KIND[kind] || RESYNC_HORIZON_DAYS;
-  const dates = eachDate(today(), addDays(today(), horizonDays - 1));
+  const dates = horizonDates(kind);
   for (const { id } of db.prepare('SELECT id FROM room_types').all()) {
     queueSync(db, id, dates, channelId);
   }
 }
 
-module.exports = { queueSync, queueFullResync, RESYNC_HORIZON_DAYS };
+/** Push the next N days of one room type to every channel that sells it (e.g. its room count or base rate changed). */
+function queueRoomTypeResync(db, roomTypeId) {
+  const channels = db.prepare(`
+    SELECT c.id, c.kind FROM channels c
+    JOIN channel_room_mappings m ON m.channel_id = c.id AND m.room_type_id = ?
+    WHERE c.enabled = 1
+  `).all(roomTypeId);
+  for (const c of channels) queueSync(db, roomTypeId, horizonDates(c.kind), c.id);
+}
+
+module.exports = { queueSync, queueFullResync, queueRoomTypeResync, RESYNC_HORIZON_DAYS };

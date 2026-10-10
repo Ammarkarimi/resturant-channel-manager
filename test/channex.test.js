@@ -1,7 +1,6 @@
 const { test, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
-const { openDb } = require('../src/db');
-const { createApp } = require('../src/app');
+const { startApp } = require('./helpers');
 const { ChannexClient } = require('../src/providers/channex/client');
 const { today, addDays } = require('../src/dates');
 
@@ -11,7 +10,7 @@ const SECRET = 'hook-secret';
 
 // ---------- Harness ----------
 
-let fake; let fakeServer; let db; let engine; let server; let base;
+let fake; let fakeServer; let db; let engine; let api; let close;
 
 const listen = (app) => new Promise((resolve) => { const s = app.listen(0, () => resolve(s)); });
 
@@ -21,26 +20,13 @@ beforeEach(async () => {
   const client = new ChannexClient({
     apiKey: API_KEY, baseUrl: `http://127.0.0.1:${fakeServer.address().port}/api/v1`, minIntervalMs: 200,
   });
-  db = openDb(':memory:');
-  const built = createApp(db, { channexClient: client, channexWebhookSecret: SECRET, channexPollMs: 0 });
-  engine = built.engine;
-  server = await listen(built.app);
-  base = `http://127.0.0.1:${server.address().port}`;
+  ({ db, engine, api, close } = await startApp({ channexClient: client, channexWebhookSecret: SECRET, channexPollMs: 0 }));
 });
 
 afterEach(async () => {
-  await new Promise((r) => server.close(r));
+  await close();
   await new Promise((r) => fakeServer.close(r));
 });
-
-async function api(method, path, body, headers = {}) {
-  const res = await fetch(base + path, {
-    method,
-    headers: { 'content-type': 'application/json', ...headers },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  return { status: res.status, body: await res.json() };
-}
 
 const MAPPINGS = [
   { room_type_id: 1, channex_room_type_id: 'rt-dlx', channex_rate_plan_id: 'rp-dlx' },
