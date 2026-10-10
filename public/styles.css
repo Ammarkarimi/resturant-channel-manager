@@ -146,3 +146,11 @@ dialog form { display: grid; gap: .7rem; }
   main { padding: .75rem 1rem; }
   .card { padding: .85rem; }
 }
+
+.channel.provider { border-color: var(--accent); }
+.steps { margin: .5rem 0 0; padding-left: 1.25rem; display: grid; gap: .3rem; }
+code { font-size: .82rem; background: var(--row-head); padding: .05rem .3rem; border-radius: 4px; word-break: break-all; }
+#provider p { margin: 0 0 .6rem; }
+#pv-form { display: grid; gap: .75rem; }
+#pv-form > label { max-width: 420px; }
+.mapping select { width: 100%; min-width: 160px; }

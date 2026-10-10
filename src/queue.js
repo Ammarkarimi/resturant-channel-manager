@@ -1,6 +1,8 @@
 const { addDays, eachDate, today } = require('./dates');
 
 const RESYNC_HORIZON_DAYS = 180;
+// Channex expects a full sync to cover 500 days.
+const HORIZON_BY_KIND = { channex: 500 };
 
 /**
  * Mark cells as needing a push to every enabled channel that sells the room
@@ -24,7 +26,9 @@ function queueSync(db, roomTypeId, dates, channelId = null) {
 }
 
 /** Push the next N days of every room type to one channel (used when a channel is (re)connected or its pricing changes). */
-function queueFullResync(db, channelId, horizonDays = RESYNC_HORIZON_DAYS) {
+function queueFullResync(db, channelId) {
+  const { kind } = db.prepare('SELECT kind FROM channels WHERE id = ?').get(channelId);
+  const horizonDays = HORIZON_BY_KIND[kind] || RESYNC_HORIZON_DAYS;
   const dates = eachDate(today(), addDays(today(), horizonDays - 1));
   for (const { id } of db.prepare('SELECT id FROM room_types').all()) {
     queueSync(db, id, dates, channelId);

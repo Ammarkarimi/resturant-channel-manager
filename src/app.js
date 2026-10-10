@@ -1,4 +1,5 @@
 const path = require('node:path');
+const crypto = require('node:crypto');
 const express = require('express');
 const { transaction } = require('./db');
 const { getGrid, bulkUpdate } = require('./inventory');
@@ -6,10 +7,29 @@ const { receiveBooking, cancelBooking, listBookings, getChannelByCode } = requir
 const { SyncEngine, retryFailed, channelView } = require('./sync');
 const { queueFullResync } = require('./queue');
 const { badRequest } = require('./errors');
+const { ChannexService } = require('./providers/channex');
+const { ChannexError } = require('./providers/channex/client');
 const { today } = require('./dates');
 
-function createApp(db, { syncIntervalMs = 1000 } = {}) {
-  const engine = new SyncEngine(db, { intervalMs: syncIntervalMs });
+// Express 4 doesn't forward rejected promises to the error handler.
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).catch(next);
+
+function safeEqual(a, b) {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+/**
+ * @param {object} opts.channexClient        ChannexClient or null
+ * @param {string} opts.channexWebhookSecret shared secret Channex sends in X-Channex-Webhook-Secret
+ * @param {number} opts.channexPollMs        how often to check Channex for bookings
+ */
+function createApp(db, {
+  syncIntervalMs = 1000, channexClient = null, channexWebhookSecret = null, channexPollMs = 60_000,
+} = {}) {
+  const engine = new SyncEngine(db, { intervalMs: syncIntervalMs, providers: { channex: channexClient } });
+  const channex = new ChannexService(db, channexClient, { onChange: () => engine.kick(), pollMs: channexPollMs });
   const app = express();
   app.use(express.json());
   app.use(express.static(path.join(__dirname, '..', 'public')));
@@ -54,6 +74,9 @@ function createApp(db, { syncIntervalMs = 1000 } = {}) {
     const sets = {};
     if (enabled !== undefined) {
       if (typeof enabled !== 'boolean') throw badRequest('enabled must be true or false');
+      if (enabled && channel.kind === 'channex' && !JSON.parse(channel.config || '{}').property_id) {
+        throw badRequest('Connect a Channex property first');
+      }
       sets.enabled = enabled ? 1 : 0;
     }
     if (simulate_outage !== undefined) {
@@ -135,6 +158,43 @@ function createApp(db, { syncIntervalMs = 1000 } = {}) {
 
   app.get('/api/bookings', (req, res) => res.json(listBookings(db)));
 
+  // ---- Connectivity provider: Channex ----
+
+  app.get('/api/providers/channex', (req, res) => res.json(channex.status()));
+
+  app.get('/api/providers/channex/properties', wrap(async (req, res) => {
+    res.json(await channex.properties());
+  }));
+
+  app.get('/api/providers/channex/properties/:id/rooms', wrap(async (req, res) => {
+    res.json(await channex.propertyRooms(req.params.id));
+  }));
+
+  app.post('/api/providers/channex/connect', wrap(async (req, res) => {
+    res.json(await channex.connect(req.body));
+  }));
+
+  app.post('/api/providers/channex/disconnect', (req, res) => res.json(channex.disconnect()));
+
+  // Check for new bookings now (also runs on a timer).
+  app.post('/api/providers/channex/pull', wrap(async (req, res) => {
+    res.json(await channex.pull());
+  }));
+
+  // Channex calls this when a booking changes. The payload only says
+  // "something changed"; the bookings themselves are fetched from Channex
+  // with our API key, so a forged call can't inject a booking.
+  app.post('/api/providers/channex/webhook', (req, res) => {
+    if (!channexWebhookSecret) {
+      return res.status(403).json({ error: 'Webhook disabled: set CHANNEX_WEBHOOK_SECRET' });
+    }
+    if (!safeEqual(req.get('x-channex-webhook-secret') || '', channexWebhookSecret)) {
+      return res.status(401).json({ error: 'Bad webhook secret' });
+    }
+    channex.pull().catch((err) => console.error('Channex booking pull failed:', err.message));
+    return res.json({ ok: true });
+  });
+
   // ---- Sync ----
 
   app.get('/api/sync/log', (req, res) => {
@@ -160,11 +220,12 @@ function createApp(db, { syncIntervalMs = 1000 } = {}) {
   // eslint-disable-next-line no-unused-vars
   app.use((err, req, res, next) => {
     if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON body' });
+    if (err instanceof ChannexError) return res.status(502).json({ error: err.message });
     if (!err.status) console.error(err);
     res.status(err.status || 500).json({ error: err.status ? err.message : 'Internal server error' });
   });
 
-  return { app, engine };
+  return { app, engine, channex };
 }
 
 module.exports = { createApp };
