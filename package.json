@@ -1,0 +1,19 @@
+{
+  "name": "hotel-channel-manager",
+  "version": "0.1.0",
+  "description": "Manage room rates and availability once and push them to every OTA (Booking.com, Agoda, MakeMyTrip, Expedia, ...).",
+  "main": "src/server.js",
+  "private": true,
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch src/server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "express": "4.21.2"
+  }
+}

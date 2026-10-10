@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Channel Manager</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1 id="property-name">Channel Manager</h1>
+      <p class="muted">Update once. Every OTA follows.</p>
+    </div>
+    <div id="sync-pill" class="pill">Loading…</div>
+  </header>
+
+  <main>
+    <!-- One-click bulk update -->
+    <section class="card" id="bulk">
+      <h2>Update rates &amp; availability</h2>
+      <form id="bulk-form">
+        <div class="row">
+          <fieldset>
+            <legend>Room types</legend>
+            <div id="bulk-rooms" class="checks"></div>
+          </fieldset>
+          <fieldset>
+            <legend>Dates</legend>
+            <div class="inline">
+              <label>From <input type="date" name="start_date" required></label>
+              <label>To <input type="date" name="end_date" required></label>
+            </div>
+            <div id="bulk-weekdays" class="weekdays" title="Leave all off to apply to every day"></div>
+          </fieldset>
+        </div>
+        <div class="row fields">
+          <label>Rate <input type="number" name="rate" min="1" step="0.01" placeholder="No change"></label>
+          <label>Rooms available <input type="number" name="available" min="0" step="1" placeholder="No change"></label>
+          <label>Min stay (nights) <input type="number" name="min_stay" min="1" max="30" step="1" placeholder="No change"></label>
+          <label>Selling
+            <select name="stop_sell">
+              <option value="">No change</option>
+              <option value="false">Open for sale</option>
+              <option value="true">Stop sell (close)</option>
+            </select>
+          </label>
+        </div>
+        <div class="actions">
+          <button type="submit" class="primary">Update all channels</button>
+          <button type="button" id="close-out" class="danger">Close out these dates</button>
+          <button type="button" id="reopen">Reopen these dates</button>
+          <span id="bulk-msg" class="msg" role="status"></span>
+        </div>
+      </form>
+    </section>
+
+    <!-- Calendar -->
+    <section class="card">
+      <div class="section-head">
+        <h2>Calendar</h2>
+        <div class="inline">
+          <button id="cal-prev" aria-label="Previous two weeks">◀</button>
+          <input type="date" id="cal-start">
+          <button id="cal-next" aria-label="Next two weeks">▶</button>
+        </div>
+      </div>
+      <p class="muted small">Click a cell to edit that night. Red = closed or sold out.</p>
+      <div class="scroll"><table id="calendar" class="grid"></table></div>
+    </section>
+
+    <!-- Channels -->
+    <section class="card">
+      <div class="section-head">
+        <h2>Connected channels</h2>
+        <button id="retry-all">Retry failed</button>
+      </div>
+      <div id="channels" class="channels"></div>
+      <div id="listing" hidden>
+        <div class="section-head">
+          <h3 id="listing-title"></h3>
+          <button id="listing-close">Close</button>
+        </div>
+        <p class="muted small">What guests currently see on this OTA (rate after markup / rooms). ✓ means it matches your calendar.</p>
+        <div class="scroll"><table id="listing-table" class="grid"></table></div>
+      </div>
+    </section>
+
+    <!-- Bookings -->
+    <section class="card">
+      <h2>Bookings</h2>
+      <details>
+        <summary>Simulate a booking arriving from an OTA</summary>
+        <form id="booking-form" class="row fields">
+          <label>Channel <select name="channel" id="bk-channel"></select></label>
+          <label>Room <select name="room" id="bk-room"></select></label>
+          <label>Check-in <input type="date" name="check_in" required></label>
+          <label>Nights <input type="number" name="nights" min="1" value="2" required></label>
+          <label>Rooms <input type="number" name="rooms" min="1" value="1" required></label>
+          <label>Guest <input type="text" name="guest_name" placeholder="Guest name"></label>
+          <div class="actions"><button type="submit" class="primary">Send booking</button>
+            <span id="booking-msg" class="msg" role="status"></span></div>
+        </form>
+      </details>
+      <div class="scroll"><table id="bookings" class="list"></table></div>
+    </section>
+
+    <section class="card">
+      <h2>Sync activity</h2>
+      <div class="scroll"><table id="sync-log" class="list"></table></div>
+    </section>
+  </main>
+
+  <dialog id="cell-dialog">
+    <form method="dialog" id="cell-form">
+      <h3 id="cell-title"></h3>
+      <label>Rate <input type="number" name="rate" min="1" step="0.01" required></label>
+      <label>Rooms available <input type="number" name="available" min="0" step="1" required></label>
+      <label>Min stay <input type="number" name="min_stay" min="1" max="30" step="1" required></label>
+      <label class="check"><input type="checkbox" name="stop_sell"> Stop sell</label>
+      <div class="actions">
+        <button value="cancel" formnovalidate>Cancel</button>
+        <button value="save" class="primary">Save &amp; sync</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
