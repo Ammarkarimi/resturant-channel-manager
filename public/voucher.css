@@ -1,0 +1,27 @@
+:root { --text: #1c2330; --muted: #5d6675; --border: #d9dee6; --accent: #2557d6; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--text); background: #f3f4f6; }
+.voucher { max-width: 760px; margin: 24px auto; background: #fff; border: 1px solid var(--border); border-radius: 10px; padding: 32px; }
+.muted { color: var(--muted); }
+.small { font-size: .85rem; }
+header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; border-bottom: 2px solid var(--accent); padding-bottom: 16px; margin-bottom: 20px; }
+h1 { font-size: 1.5rem; margin: 0; }
+h2 { font-size: 1rem; margin: 24px 0 8px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.ref { text-align: right; }
+.ref strong { font-size: 1.2rem; display: block; }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px 24px; }
+.facts div span { display: block; color: var(--muted); font-size: .8rem; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: 500; font-size: .85rem; }
+.total { text-align: right; font-size: 1.2rem; margin-top: 16px; }
+.cancelled { color: #b42318; font-weight: 700; border: 2px solid #b42318; display: inline-block; padding: 2px 10px; border-radius: 6px; }
+.actions { margin-top: 28px; display: flex; gap: 8px; }
+button { font: inherit; padding: .5rem 1rem; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+footer { margin-top: 28px; font-size: .8rem; color: var(--muted); }
+@media print {
+  body { background: #fff; }
+  .voucher { border: none; margin: 0; padding: 0; max-width: none; }
+  .actions { display: none; }
+}
+@media (max-width: 600px) { .voucher { margin: 0; border-radius: 0; padding: 20px 16px; } header { flex-direction: column; } .ref { text-align: left; } }
