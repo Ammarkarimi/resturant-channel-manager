@@ -28,11 +28,20 @@ afterEach(async () => {
   await new Promise((r) => fakeServer.close(r));
 });
 
-const MAPPINGS = [
-  { room_type_id: 1, channex_room_type_id: 'rt-dlx', channex_rate_plan_id: 'rp-dlx' },
-  { room_type_id: 2, channex_room_type_id: 'rt-exe', channex_rate_plan_id: 'rp-exe' },
-  { room_type_id: 3, channex_room_type_id: 'rt-ste', channex_rate_plan_id: 'rp-ste' },
-];
+// Demo hotel plans: 1 Deluxe EP, 2 Deluxe CP, 3 Executive EP, 4 Executive CP, 5 Suite CP, 6 Suite MAP.
+const CONNECT = {
+  property_id: 'prop-1',
+  rooms: [
+    { room_type_id: 1, channex_room_type_id: 'rt-dlx' },
+    { room_type_id: 2, channex_room_type_id: 'rt-exe' },
+    { room_type_id: 3, channex_room_type_id: 'rt-ste' },
+  ],
+  rate_plans: [
+    { rate_plan_id: 1, channex_rate_plan_id: 'rp-dlx' },
+    { rate_plan_id: 3, channex_rate_plan_id: 'rp-exe' },
+    { rate_plan_id: 5, channex_rate_plan_id: 'rp-ste' },
+  ],
+};
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -50,7 +59,7 @@ async function drain() {
 }
 
 async function connect() {
-  const r = await api('POST', '/api/providers/channex/connect', { property_id: 'prop-1', mappings: MAPPINGS });
+  const r = await api('POST', '/api/providers/channex/connect', CONNECT);
   assert.equal(r.status, 200, JSON.stringify(r.body));
   await drain();
   fake.state.calls.length = 0;
@@ -59,7 +68,7 @@ async function connect() {
 }
 
 const D0 = addDays(today(), 5);
-const avail = (rtId, date) => db.prepare('SELECT available FROM inventory WHERE room_type_id = ? AND date = ?').get(rtId, date)?.available;
+const avail = (rtId, date) => db.prepare('SELECT available FROM room_inventory WHERE room_type_id = ? AND date = ?').get(rtId, date)?.available;
 
 // ---------- Tests ----------
 
@@ -73,7 +82,7 @@ test('lists Channex properties and rooms (across pages), flagging unusable rate 
 });
 
 test('connecting sends one 500-day full sync in exactly two calls and turns off the demo OTAs', async () => {
-  const r = await api('POST', '/api/providers/channex/connect', { property_id: 'prop-1', mappings: MAPPINGS });
+  const r = await api('POST', '/api/providers/channex/connect', CONNECT);
   assert.equal(r.status, 200);
   assert.equal(r.body.connected, true);
   assert.equal(r.body.property.title, 'Test Hotel');
@@ -87,8 +96,9 @@ test('connecting sends one 500-day full sync in exactly two calls and turns off 
   assert.equal(av.values.length, 3);
   assert.deepEqual(rs.values.find((v) => v.rate_plan_id === 'rp-dlx'), {
     property_id: 'prop-1', rate_plan_id: 'rp-dlx', date_from: today(), date_to: addDays(today(), 499),
-    rate: '4500.00', stop_sell: false, min_stay: 1,
+    rate: '4500.00', stop_sell: false, closed_to_arrival: false, closed_to_departure: false, min_stay: 1, max_stay: 0,
   });
+  assert.equal(rs.values.length, 3, 'only mapped rate plans are sent');
 
   const channels = (await api('GET', '/api/channels')).body;
   for (const c of channels.filter((x) => x.kind === 'simulated')) assert.equal(c.enabled, false, c.code);
@@ -103,7 +113,7 @@ test('a bulk change sends only the changed nights, merged into ranges, in one ca
   assert.deepEqual(fake.state.calls.map((c) => c.kind), ['availability', 'restrictions']);
   assert.deepEqual(fake.state.calls[1].values, [{
     property_id: 'prop-1', rate_plan_id: 'rp-dlx', date_from: D0, date_to: addDays(D0, 2),
-    rate: '5000.00', stop_sell: true, min_stay: 2,
+    rate: '5000.00', stop_sell: true, closed_to_arrival: false, closed_to_departure: false, min_stay: 2, max_stay: 0,
   }]);
 });
 
@@ -179,6 +189,8 @@ test('bookings from Channex: new, modified and cancelled keep the calendar right
   assert.deepEqual([avail(1, D0), avail(1, addDays(D0, 1)), avail(1, addDays(D0, 2))], [8, 8, undefined]);
 
   const list = (await api('GET', '/api/bookings')).body;
+  const detail = (await api('GET', `/api/bookings/${list[0].id}`)).body;
+  assert.deepEqual(detail.lines.map((l) => l.rate_plan_name), ['Room only', 'Room only'], 'Channex rate plan mapped back to ours');
   assert.equal(list[0].source, 'Booking.com');
   assert.equal(list[0].guest_name, 'Asha Rao');
   assert.equal(list[0].rooms_summary, 'Deluxe Room ×2');
@@ -239,14 +251,17 @@ test('webhook needs the shared secret and then fetches bookings', async () => {
 });
 
 test('rejects mappings Channex could not price', async () => {
-  const bad = async (mappings) => (await api('POST', '/api/providers/channex/connect', { property_id: 'prop-1', mappings })).body.error;
-  assert.match(await bad([{ room_type_id: 3, channex_room_type_id: 'rt-ste', channex_rate_plan_id: 'rp-ste-pp' }]), /per_person/);
-  assert.match(await bad([{ room_type_id: 3, channex_room_type_id: 'rt-ste', channex_rate_plan_id: 'rp-dlx' }]), /different room type/);
-  assert.match(await bad([
-    { room_type_id: 1, channex_room_type_id: 'rt-dlx', channex_rate_plan_id: 'rp-dlx' },
-    { room_type_id: 2, channex_room_type_id: 'rt-dlx', channex_rate_plan_id: 'rp-dlx' },
-  ]), /same Channex room type/);
-  assert.equal((await api('POST', '/api/providers/channex/connect', { property_id: 'nope', mappings: MAPPINGS })).status, 400);
+  const bad = async (body) => (await api('POST', '/api/providers/channex/connect', { ...CONNECT, ...body })).body.error;
+  const ste = { rooms: [{ room_type_id: 3, channex_room_type_id: 'rt-ste' }] };
+  assert.match(await bad({ ...ste, rate_plans: [{ rate_plan_id: 5, channex_rate_plan_id: 'rp-ste-pp' }] }), /per_person/);
+  assert.match(await bad({ ...ste, rate_plans: [{ rate_plan_id: 5, channex_rate_plan_id: 'rp-dlx' }] }), /different room type/);
+  assert.match(await bad({ ...ste, rate_plans: [{ rate_plan_id: 1, channex_rate_plan_id: 'rp-dlx' }] }), /Map the room type/);
+  assert.match(await bad({
+    rooms: [{ room_type_id: 1, channex_room_type_id: 'rt-dlx' }, { room_type_id: 2, channex_room_type_id: 'rt-dlx' }],
+  }), /same Channex room type/);
+  assert.match(await bad({ rate_plans: [{ rate_plan_id: 1, channex_rate_plan_id: 'rp-dlx' }, { rate_plan_id: 2, channex_rate_plan_id: 'rp-dlx' }] }),
+    /same Channex rate plan/);
+  assert.equal((await api('POST', '/api/providers/channex/connect', { ...CONNECT, property_id: 'nope' })).status, 400);
 });
 
 test('a wrong API key is reported clearly', async () => {

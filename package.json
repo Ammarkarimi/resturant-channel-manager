@@ -15,6 +15,7 @@
   },
   "license": "UNLICENSED",
   "dependencies": {
-    "express": "4.22.3"
+    "express": "4.22.3",
+    "qrcode": "1.5.4"
   }
 }

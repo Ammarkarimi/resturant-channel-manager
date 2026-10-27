@@ -3,12 +3,14 @@ const express = require('express');
 const { SyncEngine } = require('./sync');
 const { ChannexService } = require('./providers/channex');
 const { ChannexError } = require('./providers/channex/client');
-const { publicAuthRoutes, accountRoutes, requireUser } = require('./routes/auth');
-const { hotelRoutes } = require('./routes/hotel');
+const { publicAuthRoutes, accountRoutes, userRoutes, requireUser } = require('./routes/auth');
+const { hotelRoutes, propertyListRoutes } = require('./routes/hotel');
+const { withProperty } = require('./permissions');
 const { inventoryRoutes } = require('./routes/inventory');
 const { channelRoutes } = require('./routes/channels');
 const { bookingRoutes } = require('./routes/bookings');
 const { channexRoutes, channexWebhook } = require('./routes/channex');
+const { reportRoutes, groupRoutes } = require('./routes/reports');
 
 // Sent by the dashboard on every change. Browsers won't let another site add
 // a custom header without CORS permission, so this blocks cross-site
@@ -61,7 +63,11 @@ function createApp(db, {
 
   // Everything else needs a logged-in user.
   app.use('/api', requireUser(ctx));
-  for (const routes of [accountRoutes, hotelRoutes, inventoryRoutes, channelRoutes, bookingRoutes, channexRoutes]) {
+  for (const routes of [accountRoutes, userRoutes, propertyListRoutes, groupRoutes]) app.use('/api', routes(ctx));
+
+  // From here on, requests are about one property (X-Property-Id header).
+  app.use('/api', withProperty(db));
+  for (const routes of [hotelRoutes, inventoryRoutes, channelRoutes, bookingRoutes, channexRoutes, reportRoutes]) {
     app.use('/api', routes(ctx));
   }
 

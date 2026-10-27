@@ -1,20 +1,58 @@
 const { getAdapter } = require('./channels');
-const { getCell } = require('./inventory');
+const { roomCell } = require('./inventory');
+const { Pricer, adjustPrices, PRICE_FIELDS } = require('./pricing');
 
 const MAX_ATTEMPTS = 5;
 const DEFAULT_BATCH_SIZE = 200;
 
 const backoffMs = (attempts) => Math.min(1000 * 2 ** attempts, 60_000);
-const roundMoney = (n) => Math.round(n * 100) / 100;
 
-/** Translate our inventory into what a given channel should display. */
-function channelView(cell, channel) {
+/**
+ * What one channel should show for one room type on one night: rooms left,
+ * and for every rate plan the channel sells, its prices (with the channel's
+ * markup) and restrictions. A room closed for the whole hotel, closed on
+ * this channel only, or sold out closes every plan.
+ */
+function channelUpdate(db, pricer, channel, roomTypeId, date) {
+  const rt = db.prepare('SELECT * FROM room_types WHERE id = ?').get(roomTypeId);
+  const mapping = db.prepare('SELECT external_room_id FROM channel_room_mappings WHERE channel_id = ? AND room_type_id = ?')
+    .get(channel.id, roomTypeId);
+  const cell = roomCell(db, rt, date);
+  const blocked = Boolean(db.prepare('SELECT 1 FROM channel_blocks WHERE channel_id = ? AND room_type_id = ? AND date = ?')
+    .get(channel.id, roomTypeId, date));
+  const roomClosed = cell.stop_sell || blocked;
+  const available = Math.max(0, cell.available);
+  const plans = db.prepare(`
+    SELECT rp.id, rp.active, m.external_rate_plan_id FROM channel_rate_plan_mappings m
+    JOIN rate_plans rp ON rp.id = m.rate_plan_id
+    WHERE m.channel_id = ? AND rp.room_type_id = ? ORDER BY rp.position, rp.id
+  `).all(channel.id, roomTypeId);
+
   return {
-    available: Math.max(0, cell.available),
-    rate: roundMoney(cell.rate * (1 + channel.rate_markup_pct / 100)),
-    closed: Boolean(cell.stop_sell) || cell.available <= 0,
-    stop_sell: Boolean(cell.stop_sell),
-    min_stay: cell.min_stay,
+    room_type_id: roomTypeId,
+    external_room_id: mapping?.external_room_id ?? null,
+    date,
+    available,
+    room_closed: roomClosed,
+    blocked,
+    plans: plans.map((p) => {
+      const all = pricer.prices(p.id, date);
+      const prices = adjustPrices(Object.fromEntries(PRICE_FIELDS.map((f) => [f, all[f]])), channel.rate_markup_pct);
+      const r = pricer.restrictions(p.id, date);
+      const stopSell = r.stop_sell || roomClosed || !p.active;
+      return {
+        rate_plan_id: p.id,
+        external_rate_plan_id: p.external_rate_plan_id,
+        prices,
+        rate: prices.rate_double,
+        stop_sell: stopSell,
+        closed: stopSell || available <= 0,
+        cta: r.cta,
+        ctd: r.ctd,
+        min_stay: r.min_stay,
+        max_stay: r.max_stay,
+      };
+    }),
   };
 }
 
@@ -57,8 +95,7 @@ class SyncEngine {
     const { db } = this;
     const now = new Date().toISOString();
     const due = db.prepare(`
-      SELECT q.channel_id, q.room_type_id, q.date, q.attempts, q.version,
-             m.external_room_id, m.external_rate_plan_id
+      SELECT q.channel_id, q.room_type_id, q.date, q.attempts, q.version
       FROM sync_queue q
       JOIN channels c ON c.id = q.channel_id AND c.enabled = 1
       JOIN channel_room_mappings m ON m.channel_id = q.channel_id AND m.room_type_id = q.room_type_id
@@ -101,13 +138,8 @@ class SyncEngine {
 
   async pushBatch(channel, adapter, batch) {
     const { db } = this;
-    const updates = batch.map((row) => ({
-      room_type_id: row.room_type_id,
-      external_room_id: row.external_room_id,
-      external_rate_plan_id: row.external_rate_plan_id,
-      date: row.date,
-      ...channelView(getCell(db, row.room_type_id, row.date), channel),
-    }));
+    const pricer = new Pricer(db);
+    const updates = batch.map((row) => channelUpdate(db, pricer, channel, row.room_type_id, row.date));
 
     let error = null;
     try {
@@ -150,13 +182,14 @@ class SyncEngine {
 }
 
 /** Give failed cells another round of attempts. */
-function retryFailed(db, channelId = null) {
+function retryFailed(db, propertyId, channelId = null) {
   return db.prepare(`
     UPDATE sync_queue SET status = 'pending', attempts = 0, next_attempt_at = ?
     WHERE status = 'failed' AND (? IS NULL OR channel_id = ?)
-  `).run(new Date().toISOString(), channelId, channelId).changes;
+      AND channel_id IN (SELECT id FROM channels WHERE property_id = ?)
+  `).run(new Date().toISOString(), channelId, channelId, propertyId).changes;
 }
 
 module.exports = {
-  SyncEngine, retryFailed, channelView, MAX_ATTEMPTS,
+  SyncEngine, retryFailed, channelUpdate, MAX_ATTEMPTS,
 };

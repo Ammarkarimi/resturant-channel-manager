@@ -17,6 +17,9 @@ function applyRevision(db, channel, revisionId, rev) {
   const mapping = db.prepare(
     'SELECT room_type_id FROM channel_room_mappings WHERE channel_id = ? AND external_room_id = ?'
   );
+  const planMapping = db.prepare(
+    'SELECT rate_plan_id FROM channel_rate_plan_mappings WHERE channel_id = ? AND external_rate_plan_id = ?'
+  );
   const lines = [];
   const problems = [];
   for (const room of rev.rooms || []) {
@@ -28,7 +31,17 @@ function applyRevision(db, channel, revisionId, rev) {
     } else if (!isValidDate(checkIn) || !isValidDate(checkOut) || checkOut <= checkIn) {
       problems.push(`invalid dates ${checkIn} → ${checkOut}`);
     } else {
-      lines.push({ room_type_id: m.room_type_id, check_in: checkIn, check_out: checkOut, rooms: 1 });
+      const plan = room.rate_plan_id ? planMapping.get(channel.id, room.rate_plan_id) : null;
+      const occ = room.occupancy || {};
+      lines.push({
+        room_type_id: m.room_type_id,
+        rate_plan_id: plan?.rate_plan_id ?? null,
+        check_in: checkIn,
+        check_out: checkOut,
+        rooms: 1,
+        adults: Number.isInteger(occ.adults) ? occ.adults : null,
+        children: Number.isInteger(occ.children) ? occ.children : null,
+      });
     }
   }
   if ((rev.rooms || []).length === 0) problems.push('no rooms in booking');
@@ -44,6 +57,8 @@ function applyRevision(db, channel, revisionId, rev) {
       check_in: rev.arrival_date,
       check_out: rev.departure_date,
       guest_name: guest,
+      guest_email: customer.mail || null,
+      guest_phone: customer.phone || null,
       total: rev.amount == null ? null : Number(rev.amount),
       currency: rev.currency || null,
       lines,

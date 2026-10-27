@@ -7,9 +7,9 @@ const CODE = 'channex';
 const MAX_FEED_PAGES = 50; // safety stop: 50 pages x 10 revisions per pull
 
 /**
- * Everything specific to running the hotel through Channex: connecting a
- * Channex property, mapping its rooms and rate plans to ours, and pulling
- * bookings from it. Pushing rates/availability is done by the normal sync
+ * Everything specific to running hotels through Channex: connecting each of
+ * our properties to a Channex property, mapping its rooms and rate plans to
+ * ours, and pulling bookings from it. Pushing rates/availability is done by the normal sync
  * engine through ChannexChannel.
  */
 class ChannexService {
@@ -24,12 +24,12 @@ class ChannexService {
     this.onChange = onChange;
     this.pollMs = pollMs;
     this.timer = null;
-    this.current = null;
-    this.lastPull = { at: null, ok: null, processed: 0, error: null };
+    this.running = new Map(); // channel id -> pull in progress
+    this.lastPull = new Map(); // our property id -> result of the last pull
   }
 
-  channel() {
-    return this.db.prepare('SELECT * FROM channels WHERE kind = ?').get(CODE) || null;
+  channel(propertyId) {
+    return this.db.prepare('SELECT * FROM channels WHERE property_id = ? AND kind = ?').get(propertyId, CODE) || null;
   }
 
   requireClient() {
@@ -37,22 +37,24 @@ class ChannexService {
     return this.client;
   }
 
-  status() {
-    const channel = this.channel();
+  status(propertyId) {
+    const channel = this.channel(propertyId);
     const config = channel ? JSON.parse(channel.config || '{}') : {};
-    const mappings = channel
-      ? this.db.prepare(`
-          SELECT m.room_type_id, r.name AS room_type_name, m.external_room_id AS channex_room_type_id,
-                 m.external_rate_plan_id AS channex_rate_plan_id
-          FROM channel_room_mappings m JOIN room_types r ON r.id = m.room_type_id
-          WHERE m.channel_id = ? ORDER BY r.id
-        `).all(channel.id)
-      : [];
     const titles = config.titles || {};
-    for (const m of mappings) {
-      m.channex_room_type_title = titles[m.channex_room_type_id] ?? null;
-      m.channex_rate_plan_title = titles[m.channex_rate_plan_id] ?? null;
-    }
+    const rooms = channel
+      ? this.db.prepare(`
+          SELECT m.room_type_id, r.name AS room_type_name, m.external_room_id AS channex_room_type_id
+          FROM channel_room_mappings m JOIN room_types r ON r.id = m.room_type_id
+          WHERE m.channel_id = ? ORDER BY r.position, r.id
+        `).all(channel.id).map((m) => ({ ...m, channex_room_type_title: titles[m.channex_room_type_id] ?? null }))
+      : [];
+    const plans = channel
+      ? this.db.prepare(`
+          SELECT m.rate_plan_id, rp.name AS rate_plan_name, rp.room_type_id, m.external_rate_plan_id AS channex_rate_plan_id
+          FROM channel_rate_plan_mappings m JOIN rate_plans rp ON rp.id = m.rate_plan_id
+          WHERE m.channel_id = ? ORDER BY rp.room_type_id, rp.position, rp.id
+        `).all(channel.id).map((m) => ({ ...m, channex_rate_plan_title: titles[m.channex_rate_plan_id] ?? null }))
+      : [];
     return {
       configured: Boolean(this.client),
       environment: this.client?.environment ?? null,
@@ -61,8 +63,9 @@ class ChannexService {
       property: config.property_id
         ? { id: config.property_id, title: config.property_title, currency: config.currency }
         : null,
-      mappings,
-      last_pull: this.lastPull,
+      rooms,
+      rate_plans: plans,
+      last_pull: this.lastPull.get(propertyId) || { at: null, ok: null, processed: 0, error: null },
     };
   }
 
@@ -84,37 +87,53 @@ class ChannexService {
   }
 
   /**
-   * Link our hotel to a Channex property.
-   * @param {{property_id: string, mappings: Array<{room_type_id: number, channex_room_type_id: string, channex_rate_plan_id: string}>}} body
+   * Link one of our properties to a Channex property: our room types to
+   * Channex room types, our rate plans to Channex rate plans. Rooms or plans
+   * left out are not sent.
+   * @param {{property_id: string, rooms: Array<{room_type_id, channex_room_type_id}>,
+   *          rate_plans: Array<{rate_plan_id, channex_rate_plan_id}>}} body
    */
-  async connect(body) {
+  async connect(ourPropertyId, body) {
     const client = this.requireClient();
-    const { property_id: propertyId, mappings } = body || {};
+    const { property_id: propertyId, rooms = [], rate_plans: plans = [] } = body || {};
     if (!propertyId) throw badRequest('Choose a Channex property');
-    if (!Array.isArray(mappings) || mappings.length === 0) throw badRequest('Map at least one room type');
+    if (!Array.isArray(rooms) || rooms.length === 0) throw badRequest('Map at least one room type');
+    if (!Array.isArray(plans) || plans.length === 0) throw badRequest('Map at least one rate plan');
+
+    const taken = this.db.prepare("SELECT config FROM channels WHERE kind = 'channex' AND property_id != ?").all(ourPropertyId)
+      .some((c) => JSON.parse(c.config || '{}').property_id === propertyId);
+    if (taken) throw badRequest('That Channex property is already connected to another of your properties');
 
     const property = (await client.listProperties()).find((p) => p.id === propertyId);
     if (!property) throw badRequest('That property was not found in your Channex account');
-    const { room_types: roomTypes, rate_plans: ratePlans } = await this.propertyRooms(propertyId);
+    const { room_types: cxRooms, rate_plans: cxPlans } = await this.propertyRooms(propertyId);
 
-    const ours = new Set(this.db.prepare('SELECT id FROM room_types').all().map((r) => r.id));
-    const seenOurs = new Set();
-    const seenTheirs = new Set();
-    for (const m of mappings) {
-      if (!ours.has(m.room_type_id)) throw badRequest(`Unknown room type ${m.room_type_id}`);
-      if (seenOurs.has(m.room_type_id)) throw badRequest('Each of your room types can be mapped only once');
-      if (!roomTypes.some((rt) => rt.id === m.channex_room_type_id)) {
+    const ourRooms = new Map(this.db.prepare('SELECT * FROM room_types WHERE property_id = ?').all(ourPropertyId).map((r) => [r.id, r]));
+    const roomMap = new Map(); // our room type id -> channex room type id
+    for (const m of rooms) {
+      if (!ourRooms.has(m.room_type_id)) throw badRequest(`Unknown room type ${m.room_type_id}`);
+      if (roomMap.has(m.room_type_id)) throw badRequest('Each of your room types can be mapped only once');
+      if (!cxRooms.some((rt) => rt.id === m.channex_room_type_id)) {
         throw badRequest(`Channex room type ${m.channex_room_type_id} is not in this property`);
       }
-      if (seenTheirs.has(m.channex_room_type_id)) throw badRequest('Two room types are mapped to the same Channex room type');
-      const plan = ratePlans.find((rp) => rp.id === m.channex_rate_plan_id);
-      if (!plan) throw badRequest('Choose a Channex rate plan for every mapped room type');
-      if (plan.room_type_id !== m.channex_room_type_id) throw badRequest(`Rate plan "${plan.title}" belongs to a different room type`);
-      if (!plan.usable) {
-        throw badRequest(`Rate plan "${plan.title}" is ${plan.sell_mode}/${plan.rate_mode}; only manual per-room plans are supported`);
+      if ([...roomMap.values()].includes(m.channex_room_type_id)) throw badRequest('Two room types are mapped to the same Channex room type');
+      roomMap.set(m.room_type_id, m.channex_room_type_id);
+    }
+    const planMap = new Map();
+    for (const m of plans) {
+      const ours = this.db.prepare(`SELECT rp.* FROM rate_plans rp JOIN room_types rt ON rt.id = rp.room_type_id
+                                    WHERE rp.id = ? AND rt.property_id = ?`).get(m.rate_plan_id, ourPropertyId);
+      if (!ours) throw badRequest(`Unknown rate plan ${m.rate_plan_id}`);
+      if (planMap.has(ours.id)) throw badRequest('Each of your rate plans can be mapped only once');
+      if (!roomMap.has(ours.room_type_id)) throw badRequest(`Map the room type of "${ours.name}" first`);
+      const theirs = cxPlans.find((rp) => rp.id === m.channex_rate_plan_id);
+      if (!theirs) throw badRequest(`Channex rate plan ${m.channex_rate_plan_id} is not in this property`);
+      if (theirs.room_type_id !== roomMap.get(ours.room_type_id)) throw badRequest(`Rate plan "${theirs.title}" belongs to a different room type`);
+      if (!theirs.usable) {
+        throw badRequest(`Rate plan "${theirs.title}" is ${theirs.sell_mode}/${theirs.rate_mode}; only manual per-room plans are supported`);
       }
-      seenOurs.add(m.room_type_id);
-      seenTheirs.add(m.channex_room_type_id);
+      if ([...planMap.values()].includes(theirs.id)) throw badRequest('Two rate plans are mapped to the same Channex rate plan');
+      planMap.set(ours.id, theirs.id);
     }
 
     const config = JSON.stringify({
@@ -123,68 +142,82 @@ class ChannexService {
       currency: property.currency,
       min_stay_type: property.min_stay_type,
       // Names to show in the dashboard; ids are what we send.
-      titles: Object.fromEntries([...roomTypes, ...ratePlans].map((x) => [x.id, x.title])),
+      titles: Object.fromEntries([...cxRooms, ...cxPlans].map((x) => [x.id, x.title])),
     });
 
     transaction(this.db, () => {
       const db = this.db;
-      let channel = this.channel();
+      let channel = this.channel(ourPropertyId);
       if (channel) {
         db.prepare('UPDATE channels SET enabled = 1, config = ? WHERE id = ?').run(config, channel.id);
       } else {
-        db.prepare(`INSERT INTO channels (code, name, kind, config, enabled, rate_markup_pct)
-                    VALUES (?, 'Channex', 'channex', ?, 1, 0)`).run(CODE, config);
-        channel = this.channel();
+        db.prepare(`INSERT INTO channels (property_id, code, name, kind, config, enabled, rate_markup_pct)
+                    VALUES (?, ?, 'Channex', 'channex', ?, 1, 0)`).run(ourPropertyId, CODE, config);
+        channel = this.channel(ourPropertyId);
       }
-      db.prepare('DELETE FROM sync_queue WHERE channel_id = ?').run(channel.id);
-      db.prepare('DELETE FROM channel_room_mappings WHERE channel_id = ?').run(channel.id);
-      const ins = db.prepare(`INSERT INTO channel_room_mappings (channel_id, room_type_id, external_room_id, external_rate_plan_id)
-                              VALUES (?, ?, ?, ?)`);
-      for (const m of mappings) ins.run(channel.id, m.room_type_id, m.channex_room_type_id, m.channex_rate_plan_id);
+      for (const t of ['sync_queue', 'channel_room_mappings', 'channel_rate_plan_mappings']) {
+        db.prepare(`DELETE FROM ${t} WHERE channel_id = ?`).run(channel.id);
+      }
+      const insRoom = db.prepare('INSERT INTO channel_room_mappings (channel_id, room_type_id, external_room_id) VALUES (?, ?, ?)');
+      for (const [ours, theirs] of roomMap) insRoom.run(channel.id, ours, theirs);
+      const insPlan = db.prepare('INSERT INTO channel_rate_plan_mappings (channel_id, rate_plan_id, external_rate_plan_id) VALUES (?, ?, ?)');
+      for (const [ours, theirs] of planMap) insPlan.run(channel.id, ours, theirs);
 
       // The demo OTAs are stand-ins; once real OTAs are reached through
       // Channex they'd only add noise. They can be switched back on.
-      db.prepare("DELETE FROM sync_queue WHERE channel_id IN (SELECT id FROM channels WHERE kind = 'simulated')").run();
-      db.prepare("UPDATE channels SET enabled = 0 WHERE kind = 'simulated'").run();
+      db.prepare(`DELETE FROM sync_queue WHERE channel_id IN
+                  (SELECT id FROM channels WHERE property_id = ? AND kind = 'simulated')`).run(ourPropertyId);
+      db.prepare("UPDATE channels SET enabled = 0 WHERE property_id = ? AND kind = 'simulated'").run(ourPropertyId);
 
       queueFullResync(db, channel.id);
     });
 
     const warnings = [];
-    const ourCurrency = this.db.prepare('SELECT currency FROM property WHERE id = 1').get().currency;
+    const ourCurrency = this.db.prepare('SELECT currency FROM properties WHERE id = ?').get(ourPropertyId).currency;
     if (property.currency !== ourCurrency) {
       warnings.push(`Channex property uses ${property.currency} but this hotel uses ${ourCurrency}. Rates are sent as-is.`);
     }
-    const unmapped = this.db.prepare('SELECT name FROM room_types').all().length - mappings.length;
-    if (unmapped > 0) warnings.push(`${unmapped} room type(s) are not mapped and won't be sent to Channex.`);
+    const unmappedRooms = ourRooms.size - roomMap.size;
+    if (unmappedRooms > 0) warnings.push(`${unmappedRooms} room type(s) are not mapped and won't be sent to Channex.`);
+    const ourPlanCount = this.db.prepare(`SELECT COUNT(*) AS n FROM rate_plans rp JOIN room_types rt ON rt.id = rp.room_type_id
+                                          WHERE rt.property_id = ?`).get(ourPropertyId).n;
+    if (ourPlanCount > planMap.size) warnings.push(`${ourPlanCount - planMap.size} rate plan(s) are not mapped and won't be sold through Channex.`);
 
     this.onChange();
-    this.pull().catch(() => {});
-    return { ...this.status(), warnings };
+    this.pull(ourPropertyId).catch(() => {});
+    return { ...this.status(ourPropertyId), warnings };
   }
 
-  disconnect() {
-    const channel = this.channel();
-    if (!channel) return this.status();
+  disconnect(propertyId) {
+    const channel = this.channel(propertyId);
+    if (!channel) return this.status(propertyId);
     transaction(this.db, () => {
       this.db.prepare('UPDATE channels SET enabled = 0 WHERE id = ?').run(channel.id);
       this.db.prepare('DELETE FROM sync_queue WHERE channel_id = ?').run(channel.id);
     });
-    return this.status();
+    return this.status(propertyId);
   }
 
-  /** Fetch and apply new booking revisions. Concurrent calls share one run. */
-  pull() {
-    if (!this.current) {
-      this.current = this.pullOnce().finally(() => { this.current = null; });
+  /**
+   * Fetch and apply new booking revisions for one property, or for every
+   * connected property. Concurrent calls for the same property share one run.
+   */
+  async pull(propertyId = null) {
+    const channels = this.db.prepare("SELECT * FROM channels WHERE kind = 'channex' AND enabled = 1 AND (? IS NULL OR property_id = ?)")
+      .all(propertyId, propertyId);
+    let processed = 0;
+    for (const channel of channels) {
+      if (!this.running.has(channel.id)) {
+        this.running.set(channel.id, this.pullOnce(channel).finally(() => this.running.delete(channel.id)));
+      }
+      processed += (await this.running.get(channel.id)).processed;
     }
-    return this.current;
+    return { processed };
   }
 
-  async pullOnce() {
-    const channel = this.channel();
-    const config = channel ? JSON.parse(channel.config || '{}') : {};
-    if (!this.client || !channel?.enabled || !config.property_id) return { processed: 0, skipped: true };
+  async pullOnce(channel) {
+    const config = JSON.parse(channel.config || '{}');
+    if (!this.client || !config.property_id) return { processed: 0, skipped: true };
 
     let processed = 0;
     try {
@@ -198,9 +231,9 @@ class ChannexService {
           await this.client.ackRevision(r.id);
         }
       }
-      this.lastPull = { at: new Date().toISOString(), ok: true, processed, error: null };
+      this.lastPull.set(channel.property_id, { at: new Date().toISOString(), ok: true, processed, error: null });
     } catch (err) {
-      this.lastPull = { at: new Date().toISOString(), ok: false, processed, error: err.message };
+      this.lastPull.set(channel.property_id, { at: new Date().toISOString(), ok: false, processed, error: err.message });
       throw err;
     } finally {
       if (processed > 0) this.onChange();

@@ -1,202 +1,78 @@
 const { DatabaseSync } = require('node:sqlite');
+const { SCHEMA, SCHEMA_VERSION } = require('./schema');
+const { upgradeToV2 } = require('./migrations/legacy');
+const { upgradeV2toV3 } = require('./migrations/v3');
 const { queueFullResync } = require('./queue');
 
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS property (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  name TEXT NOT NULL,
-  currency TEXT NOT NULL
-);
+const tableExists = (db, name) =>
+  Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
 
-CREATE TABLE IF NOT EXISTS room_types (
-  id INTEGER PRIMARY KEY,
-  code TEXT NOT NULL UNIQUE,
-  name TEXT NOT NULL,
-  total_rooms INTEGER NOT NULL,
-  base_rate REAL NOT NULL
-);
-
--- One row per connection: either a single OTA, or a connectivity provider
--- (kind = 'channex') that fans out to every OTA connected inside it.
-CREATE TABLE IF NOT EXISTS channels (
-  id INTEGER PRIMARY KEY,
-  code TEXT NOT NULL UNIQUE,
-  name TEXT NOT NULL,
-  kind TEXT NOT NULL DEFAULT 'simulated',   -- simulated | channex | direct
-  config TEXT,                               -- JSON, provider settings
-  enabled INTEGER NOT NULL DEFAULT 1,
-  -- OTAs charge commission, so hotels usually sell a little higher there.
-  rate_markup_pct REAL NOT NULL DEFAULT 0,
-  -- Demo switch: makes the simulated OTA reject pushes so retries can be seen.
-  simulate_outage INTEGER NOT NULL DEFAULT 0
-);
-
--- Which room on the OTA corresponds to which of our room types.
-CREATE TABLE IF NOT EXISTS channel_room_mappings (
-  channel_id INTEGER NOT NULL REFERENCES channels(id),
-  room_type_id INTEGER NOT NULL REFERENCES room_types(id),
-  external_room_id TEXT NOT NULL,
-  -- Providers like Channex price per rate plan rather than per room.
-  external_rate_plan_id TEXT,
-  PRIMARY KEY (channel_id, room_type_id),
-  UNIQUE (channel_id, external_room_id)
-);
-
--- The single source of truth: what we sell, per room type per night.
--- Missing rows mean "default": all rooms free at the base rate.
-CREATE TABLE IF NOT EXISTS inventory (
-  room_type_id INTEGER NOT NULL REFERENCES room_types(id),
-  date TEXT NOT NULL,
-  available INTEGER NOT NULL,
-  rate REAL NOT NULL,
-  stop_sell INTEGER NOT NULL DEFAULT 0,
-  min_stay INTEGER NOT NULL DEFAULT 1,
-  updated_at TEXT NOT NULL,
-  PRIMARY KEY (room_type_id, date)
-);
-
--- Cells that still need pushing to a channel. The payload is read from
--- inventory at send time, so a channel always receives the latest values
--- and repeated edits to the same cell collapse into one push.
-CREATE TABLE IF NOT EXISTS sync_queue (
-  channel_id INTEGER NOT NULL REFERENCES channels(id),
-  room_type_id INTEGER NOT NULL REFERENCES room_types(id),
-  date TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',   -- pending | failed
-  attempts INTEGER NOT NULL DEFAULT 0,
-  version INTEGER NOT NULL DEFAULT 0,
-  next_attempt_at TEXT NOT NULL,
-  last_error TEXT,
-  PRIMARY KEY (channel_id, room_type_id, date)
-);
-
-CREATE TABLE IF NOT EXISTS sync_log (
-  id INTEGER PRIMARY KEY,
-  channel_id INTEGER NOT NULL REFERENCES channels(id),
-  cells INTEGER NOT NULL,
-  ok INTEGER NOT NULL,
-  message TEXT,
-  created_at TEXT NOT NULL
-);
-
--- What each (simulated) OTA is currently showing to guests.
-CREATE TABLE IF NOT EXISTS channel_listings (
-  channel_id INTEGER NOT NULL REFERENCES channels(id),
-  external_room_id TEXT NOT NULL,
-  date TEXT NOT NULL,
-  available INTEGER NOT NULL,
-  rate REAL NOT NULL,
-  closed INTEGER NOT NULL,
-  min_stay INTEGER NOT NULL,
-  synced_at TEXT NOT NULL,
-  PRIMARY KEY (channel_id, external_room_id, date)
-);
-
-CREATE TABLE IF NOT EXISTS bookings (
-  id INTEGER PRIMARY KEY,
-  channel_id INTEGER NOT NULL REFERENCES channels(id),
-  external_ref TEXT NOT NULL,
-  source TEXT,                               -- OTA name when it came through a provider
-  check_in TEXT NOT NULL,
-  check_out TEXT NOT NULL,
-  guest_name TEXT,
-  total REAL,
-  currency TEXT,
-  status TEXT NOT NULL DEFAULT 'confirmed',  -- confirmed | cancelled
-  overbooked INTEGER NOT NULL DEFAULT 0,
-  needs_attention TEXT,                      -- e.g. a room we couldn't map
-  notes TEXT,
-  handled_at TEXT,                           -- staff dealt with the overbooking / attention flag
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  UNIQUE (channel_id, external_ref)
-);
-
--- The rooms a booking holds. A booking can span several room types.
-CREATE TABLE IF NOT EXISTS booking_lines (
-  id INTEGER PRIMARY KEY,
-  booking_id INTEGER NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
-  room_type_id INTEGER NOT NULL REFERENCES room_types(id),
-  check_in TEXT NOT NULL,
-  check_out TEXT NOT NULL,
-  rooms INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY,
-  email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-  name TEXT NOT NULL,
-  password_hash TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-
--- Only a hash of the session token is stored, so a leaked database can't be
--- used to log in.
-CREATE TABLE IF NOT EXISTS sessions (
-  token_hash TEXT PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  created_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL
-);
-
--- Who changed what, for the "Recent changes" list.
-CREATE TABLE IF NOT EXISTS activity (
-  id INTEGER PRIMARY KEY,
-  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-  user_name TEXT,
-  action TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-
--- Provider booking revisions already applied, so a re-delivered one is not
--- counted twice (e.g. when the acknowledgement to Channex failed).
-CREATE TABLE IF NOT EXISTS provider_revisions (
-  channel_id INTEGER NOT NULL REFERENCES channels(id),
-  revision_id TEXT NOT NULL,
-  processed_at TEXT NOT NULL,
-  PRIMARY KEY (channel_id, revision_id)
-);
-`;
-
-const columns = (db, table) => db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
-
-// Bring a database created by an earlier version up to the current schema.
-function migrateBefore(db) {
-  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((t) => t.name);
-  // v1 stored one room type per booking; move it aside and copy it into lines below.
-  if (tables.includes('bookings') && columns(db, 'bookings').includes('room_type_id')) {
-    db.exec('ALTER TABLE bookings RENAME TO bookings_v1');
+function openDb(file = ':memory:') {
+  const db = new DatabaseSync(file);
+  if (file !== ':memory:') db.exec('PRAGMA journal_mode = WAL;');
+  // Foreign keys must be off while tables are rebuilt by an upgrade; they
+  // are checked explicitly before committing.
+  db.exec('PRAGMA foreign_keys = OFF;');
+  const version = db.prepare('PRAGMA user_version').get().user_version;
+  // Versions before 3 never set user_version; they are recognised by their
+  // single-hotel "property" table.
+  const upgrading = version < SCHEMA_VERSION && tableExists(db, 'property');
+  transaction(db, () => {
+    if (upgrading) {
+      upgradeToV2(db);
+      upgradeV2toV3(db);
+    }
+    db.exec(SCHEMA);
+    const broken = db.prepare('PRAGMA foreign_key_check').all();
+    if (broken.length) throw new Error(`Database upgrade left broken references: ${JSON.stringify(broken.slice(0, 5))}`);
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    for (const { id } of db.prepare('SELECT id FROM properties').all()) ensureDirectChannel(db, id);
+  });
+  db.exec('PRAGMA foreign_keys = ON;');
+  if (upgrading) {
+    // The way rates are sent changed; give every channel a fresh copy.
+    transaction(db, () => {
+      for (const c of db.prepare("SELECT id FROM channels WHERE enabled = 1 AND kind != 'direct'").all()) queueFullResync(db, c.id);
+    });
   }
+  return db;
 }
 
-function migrateAfter(db) {
-  const addColumn = (table, name, def) => {
-    if (!columns(db, table).includes(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${def}`);
-  };
-  addColumn('channels', 'kind', "TEXT NOT NULL DEFAULT 'simulated'");
-  addColumn('channels', 'config', 'TEXT');
-  addColumn('channel_room_mappings', 'external_rate_plan_id', 'TEXT');
-  addColumn('bookings', 'notes', 'TEXT');
-  addColumn('bookings', 'handled_at', 'TEXT');
+/** Bookings taken by phone or at the desk. Never pushed anywhere itself; it only takes rooms out of what the OTAs can sell. */
+function ensureDirectChannel(db, propertyId) {
+  db.prepare(`INSERT OR IGNORE INTO channels (property_id, code, name, kind, enabled)
+              VALUES (?, 'direct', 'Direct / walk-in', 'direct', 1)`).run(propertyId);
+}
 
-  const hasV1 = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bookings_v1'").get();
-  if (hasV1) {
-    db.exec(`
-      INSERT INTO bookings (id, channel_id, external_ref, check_in, check_out, guest_name, total,
-                            status, overbooked, created_at, updated_at)
-      SELECT id, channel_id, external_ref, check_in, check_out, guest_name, total,
-             status, overbooked, created_at, created_at FROM bookings_v1;
-      INSERT INTO booking_lines (booking_id, room_type_id, check_in, check_out, rooms)
-      SELECT id, room_type_id, check_in, check_out, rooms FROM bookings_v1;
-      DROP TABLE bookings_v1;
-    `);
-  }
+function createProperty(db, { name, currency, city = null, country = null }) {
+  const id = Number(db.prepare('INSERT INTO properties (name, currency, city, country, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(name, currency, city, country, new Date().toISOString()).lastInsertRowid);
+  ensureDirectChannel(db, id);
+  return id;
 }
 
 const SEED_ROOMS = [
-  { code: 'DLX', name: 'Deluxe Room', total_rooms: 10, base_rate: 4500 },
-  { code: 'EXE', name: 'Executive Room', total_rooms: 6, base_rate: 6500 },
-  { code: 'STE', name: 'Suite', total_rooms: 2, base_rate: 12000 },
+  {
+    code: 'DLX', name: 'Deluxe Room', total_rooms: 10, max_adults: 3,
+    plans: [
+      { code: 'EP', name: 'Room only', meal_plan: 'EP', rate_double: 4500, rate_single: 4000, rate_triple: 5300, extra_adult: 900, extra_child: 500 },
+      { code: 'CP', name: 'With breakfast', meal_plan: 'CP', parent: 'EP', derive_type: 'amount', derive_value: 600 },
+    ],
+  },
+  {
+    code: 'EXE', name: 'Executive Room', total_rooms: 6, max_adults: 3,
+    plans: [
+      { code: 'EP', name: 'Room only', meal_plan: 'EP', rate_double: 6500, rate_single: 6000, extra_adult: 1100, extra_child: 600 },
+      { code: 'CP', name: 'With breakfast', meal_plan: 'CP', parent: 'EP', derive_type: 'amount', derive_value: 700 },
+    ],
+  },
+  {
+    code: 'STE', name: 'Suite', total_rooms: 2, max_adults: 4,
+    plans: [
+      { code: 'CP', name: 'With breakfast', meal_plan: 'CP', rate_double: 12000, extra_adult: 1500, extra_child: 800 },
+      { code: 'MAP', name: 'Breakfast and dinner', meal_plan: 'MAP', parent: 'CP', derive_type: 'percent', derive_value: 15 },
+    ],
+  },
 ];
 
 const SEED_CHANNELS = [
@@ -206,45 +82,42 @@ const SEED_CHANNELS = [
   { code: 'expedia', name: 'Expedia', prefix: 'EXP', markup: 18 },
 ];
 
-/** Fill an empty hotel with sample rooms and four simulated OTAs to try things out. */
-function seedDemo(db) {
-  if (db.prepare('SELECT COUNT(*) AS n FROM room_types').get().n > 0) return;
-  const insRoom = db.prepare(
-    'INSERT INTO room_types (code, name, total_rooms, base_rate) VALUES (?, ?, ?, ?)'
-  );
-  const insChannel = db.prepare(
-    "INSERT INTO channels (code, name, kind, rate_markup_pct) VALUES (?, ?, 'simulated', ?)"
-  );
-  const insMap = db.prepare(
-    'INSERT INTO channel_room_mappings (channel_id, room_type_id, external_room_id) VALUES (?, ?, ?)'
-  );
+/** Fill an empty property with sample rooms, rate plans and four simulated OTAs to try things out. */
+function seedDemo(db, propertyId) {
+  if (db.prepare('SELECT COUNT(*) AS n FROM room_types WHERE property_id = ?').get(propertyId).n > 0) return;
+  const now = new Date().toISOString();
+  const insRoom = db.prepare(`INSERT INTO room_types (property_id, code, name, total_rooms, max_adults, position)
+                              VALUES (?, ?, ?, ?, ?, ?)`);
+  const insPlan = db.prepare(`
+    INSERT INTO rate_plans (room_type_id, code, name, meal_plan, rate_double, rate_single, rate_triple, extra_adult, extra_child,
+                            parent_id, derive_type, derive_value, position, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const rooms = SEED_ROOMS.map((r, i) => {
+    const id = Number(insRoom.run(propertyId, r.code, r.name, r.total_rooms, r.max_adults, i).lastInsertRowid);
+    const planIds = {};
+    r.plans.forEach((p, j) => {
+      const parent = p.parent ? planIds[p.parent] : null;
+      planIds[p.code] = Number(insPlan.run(id, p.code, p.name, p.meal_plan, p.rate_double ?? 0, p.rate_single ?? null,
+        p.rate_triple ?? null, p.extra_adult ?? null, p.extra_child ?? null, parent, p.derive_type ?? null,
+        p.derive_value ?? null, j, now).lastInsertRowid);
+    });
+    return { ...r, id, planIds };
+  });
 
-  const roomIds = SEED_ROOMS.map(
-    (r) => ({ ...r, id: Number(insRoom.run(r.code, r.name, r.total_rooms, r.base_rate).lastInsertRowid) })
-  );
+  const insChannel = db.prepare(`INSERT INTO channels (property_id, code, name, kind, rate_markup_pct)
+                                 VALUES (?, ?, ?, 'simulated', ?)`);
+  const insRoomMap = db.prepare('INSERT INTO channel_room_mappings (channel_id, room_type_id, external_room_id) VALUES (?, ?, ?)');
+  const insPlanMap = db.prepare('INSERT INTO channel_rate_plan_mappings (channel_id, rate_plan_id, external_rate_plan_id) VALUES (?, ?, ?)');
   for (const c of SEED_CHANNELS) {
-    if (db.prepare('SELECT 1 FROM channels WHERE code = ?').get(c.code)) continue;
-    const channelId = Number(insChannel.run(c.code, c.name, c.markup).lastInsertRowid);
-    for (const r of roomIds) insMap.run(channelId, r.id, `${c.prefix}-${r.code}`);
+    if (db.prepare('SELECT 1 FROM channels WHERE property_id = ? AND code = ?').get(propertyId, c.code)) continue;
+    const channelId = Number(insChannel.run(propertyId, c.code, c.name, c.markup).lastInsertRowid);
+    for (const r of rooms) {
+      insRoomMap.run(channelId, r.id, `${c.prefix}-${r.code}`);
+      for (const [code, planId] of Object.entries(r.planIds)) insPlanMap.run(channelId, planId, `${c.prefix}-${r.code}-${code}`);
+    }
     // Give every OTA the starting rates and availability.
     queueFullResync(db, channelId);
   }
-}
-
-function openDb(file = ':memory:') {
-  const db = new DatabaseSync(file);
-  db.exec('PRAGMA foreign_keys = ON;');
-  if (file !== ':memory:') db.exec('PRAGMA journal_mode = WAL;');
-  transaction(db, () => {
-    migrateBefore(db);
-    db.exec(SCHEMA);
-    migrateAfter(db);
-    // Bookings taken by phone or at the desk. Never pushed anywhere itself;
-    // it only takes rooms out of what the OTAs can sell.
-    db.prepare(`INSERT OR IGNORE INTO channels (code, name, kind, enabled)
-                VALUES ('direct', 'Direct / walk-in', 'direct', 1)`).run();
-  });
-  return db;
 }
 
 const depth = new WeakMap();
@@ -267,4 +140,4 @@ function transaction(db, fn) {
   }
 }
 
-module.exports = { openDb, transaction, seedDemo };
+module.exports = { openDb, transaction, seedDemo, createProperty, ensureDirectChannel };

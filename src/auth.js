@@ -38,7 +38,7 @@ function createSession(db, userId) {
 function sessionUser(db, token) {
   if (!token) return null;
   return db.prepare(`
-    SELECT u.id, u.email, u.name FROM sessions s JOIN users u ON u.id = s.user_id
+    SELECT u.id, u.email, u.name, u.role, u.all_properties, u.totp_enabled FROM sessions s JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = ? AND s.expires_at > ?
   `).get(sha256(token), new Date().toISOString()) || null;
 }
@@ -78,12 +78,54 @@ function validatePassword(password) {
   if (password.length > 200) throw badRequest('Password is too long');
 }
 
+const ROLE_NAMES = ['admin', 'manager', 'front_desk', 'viewer'];
+
+/** Who can reach which properties: everything, or a list. */
+function validateAccess(db, { role, all_properties: all, property_ids: ids }, { partial = false } = {}) {
+  const out = {};
+  if (!partial || role !== undefined) {
+    const r = role ?? 'admin';
+    if (!ROLE_NAMES.includes(r)) throw badRequest(`Role must be one of ${ROLE_NAMES.join(', ')}`);
+    out.role = r;
+  }
+  if (!partial || all !== undefined || ids !== undefined) {
+    const everything = all === undefined ? !Array.isArray(ids) : Boolean(all);
+    out.all_properties = everything ? 1 : 0;
+    out.property_ids = [];
+    if (!everything) {
+      if (!Array.isArray(ids) || ids.length === 0) throw badRequest('Choose at least one property, or all properties');
+      for (const id of ids) {
+        if (!db.prepare('SELECT 1 FROM properties WHERE id = ?').get(Number(id))) throw badRequest(`Property ${id} not found`);
+      }
+      out.property_ids = [...new Set(ids.map(Number))];
+    }
+  }
+  return out;
+}
+
+function setUserProperties(db, userId, ids) {
+  db.prepare('DELETE FROM user_properties WHERE user_id = ?').run(userId);
+  const ins = db.prepare('INSERT INTO user_properties (user_id, property_id) VALUES (?, ?)');
+  for (const id of ids) ins.run(userId, id);
+}
+
+function publicUser(db, id) {
+  const u = db.prepare('SELECT id, email, name, role, all_properties, totp_enabled, created_at FROM users WHERE id = ?').get(id);
+  if (!u) return null;
+  u.property_ids = db.prepare('SELECT property_id FROM user_properties WHERE user_id = ?').all(id).map((r) => r.property_id);
+  u.all_properties = Boolean(u.all_properties);
+  u.totp_enabled = Boolean(u.totp_enabled);
+  return u;
+}
+
 function createUser(db, input) {
   const { name, email, password } = validateNewUser(input);
+  const access = validateAccess(db, input);
   if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) throw badRequest('A user with that email already exists');
-  const id = db.prepare('INSERT INTO users (email, name, password_hash, created_at) VALUES (?, ?, ?, ?)')
-    .run(email, name, hashPassword(password), new Date().toISOString()).lastInsertRowid;
-  return db.prepare('SELECT id, email, name, created_at FROM users WHERE id = ?').get(id);
+  const id = Number(db.prepare('INSERT INTO users (email, name, password_hash, role, all_properties, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(email, name, hashPassword(password), access.role, access.all_properties, new Date().toISOString()).lastInsertRowid);
+  setUserProperties(db, id, access.property_ids);
+  return publicUser(db, id);
 }
 
 /** Slows down password guessing: too many failures for an email or IP locks it for a while. */
@@ -118,5 +160,5 @@ class LoginLimiter {
 
 module.exports = {
   COOKIE, hashPassword, verifyPassword, createSession, sessionUser, endSession, endOtherSessions, readCookie, cookieOptions,
-  createUser, validatePassword, LoginLimiter,
+  createUser, validatePassword, validateAccess, setUserProperties, publicUser, sha256, ROLE_NAMES, LoginLimiter,
 };

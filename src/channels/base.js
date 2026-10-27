@@ -15,11 +15,14 @@ class ChannelAdapter {
   }
 
   /**
-   * Push rate / availability / restriction changes to the OTA.
-   * Must throw if the OTA rejects the update; the cells will then be retried.
+   * Push availability, prices and restrictions to the channel.
+   * Must throw if the channel rejects the update; the nights will then be retried.
    *
-   * @param {Array<{external_room_id: string, date: string, available: number,
-   *                rate: number, closed: boolean, min_stay: number}>} updates
+   * @param {Array<{room_type_id: number, external_room_id: string, date: string, available: number,
+   *                room_closed: boolean, plans: Array<{rate_plan_id: number, external_rate_plan_id: string,
+   *                prices: object, rate: number, stop_sell: boolean, closed: boolean, cta: boolean,
+   *                ctd: boolean, min_stay: number, max_stay: number|null}>}>} updates
+   *        One entry per room type and night; see channelUpdate() in src/sync.js.
    */
   // eslint-disable-next-line no-unused-vars
   async pushUpdates(updates) {

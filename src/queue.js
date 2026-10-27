@@ -5,9 +5,9 @@ const RESYNC_HORIZON_DAYS = 180;
 const HORIZON_BY_KIND = { channex: 500 };
 
 /**
- * Mark cells as needing a push to every enabled channel that sells the room
- * type (or only `channelId` when given). Bumping `version` lets the worker
- * tell whether a cell changed again while its push was in flight.
+ * Mark room-nights as needing a push to every enabled channel that sells the
+ * room type (or only `channelId` when given). Bumping `version` lets the
+ * worker tell whether a night changed again while its push was in flight.
  */
 function queueSync(db, roomTypeId, dates, channelId = null) {
   const stmt = db.prepare(`
@@ -32,21 +32,29 @@ function horizonDates(kind) {
 
 /** Push the next N days of every room type to one channel (used when a channel is (re)connected or its pricing changes). */
 function queueFullResync(db, channelId) {
-  const { kind } = db.prepare('SELECT kind FROM channels WHERE id = ?').get(channelId);
-  const dates = horizonDates(kind);
-  for (const { id } of db.prepare('SELECT id FROM room_types').all()) {
+  const channel = db.prepare('SELECT kind, property_id FROM channels WHERE id = ?').get(channelId);
+  const dates = horizonDates(channel.kind);
+  for (const { id } of db.prepare('SELECT id FROM room_types WHERE property_id = ?').all(channel.property_id)) {
     queueSync(db, id, dates, channelId);
   }
 }
 
-/** Push the next N days of one room type to every channel that sells it (e.g. its room count or base rate changed). */
-function queueRoomTypeResync(db, roomTypeId) {
+/** Push the next N days of one room type to every channel that sells it (e.g. its room count or default prices changed). */
+function queueRoomTypeResync(db, roomTypeId, { from = today(), to = null } = {}) {
   const channels = db.prepare(`
     SELECT c.id, c.kind FROM channels c
     JOIN channel_room_mappings m ON m.channel_id = c.id AND m.room_type_id = ?
     WHERE c.enabled = 1
   `).all(roomTypeId);
-  for (const c of channels) queueSync(db, roomTypeId, horizonDates(c.kind), c.id);
+  for (const c of channels) {
+    const dates = horizonDates(c.kind).filter((d) => d >= from && (!to || d <= to));
+    queueSync(db, roomTypeId, dates, c.id);
+  }
 }
 
-module.exports = { queueSync, queueFullResync, queueRoomTypeResync, RESYNC_HORIZON_DAYS };
+/** Every room type of a property, e.g. after its yield rules changed. */
+function queuePropertyResync(db, propertyId) {
+  for (const { id } of db.prepare('SELECT id FROM room_types WHERE property_id = ?').all(propertyId)) queueRoomTypeResync(db, id);
+}
+
+module.exports = { queueSync, queueFullResync, queueRoomTypeResync, queuePropertyResync, RESYNC_HORIZON_DAYS };

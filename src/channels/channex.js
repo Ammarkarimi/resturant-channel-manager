@@ -37,8 +37,8 @@ const dates = (r) => (r.date_from === r.date_to ? { date: r.date_from } : { date
  * Sends our calendar to Channex, which passes it on to every OTA connected
  * to the property there (Booking.com, Agoda, MakeMyTrip, Expedia, ...).
  *
- * Availability is set per Channex room type; rate, stop-sell and minimum stay
- * per Channex rate plan.
+ * Availability is set per Channex room type; price, stop-sell, closed to
+ * arrival/departure and minimum/maximum stay per Channex rate plan.
  */
 class ChannexChannel extends ChannelAdapter {
   constructor(channel, ctx) {
@@ -61,17 +61,29 @@ class ChannexChannel extends ChannelAdapter {
     // `min_stay` is translated by Channex according to the property's
     // min-stay type, but isn't accepted when that type is "both".
     const minStayField = this.config.min_stay_type === 'both' ? 'min_stay_arrival' : 'min_stay';
+    const planNights = current.flatMap((u) => u.plans.map((p) => ({ ...p, date: u.date })));
     const restrictions = toRanges(
-      current.filter((u) => u.external_rate_plan_id),
-      (u) => u.external_rate_plan_id,
-      (u) => ({ rate: u.rate.toFixed(2), stop_sell: u.stop_sell, min_stay: u.min_stay }),
+      planNights,
+      (p) => p.external_rate_plan_id,
+      (p) => ({
+        rate: p.rate.toFixed(2),
+        stop_sell: p.stop_sell,
+        closed_to_arrival: p.cta,
+        closed_to_departure: p.ctd,
+        min_stay: p.min_stay,
+        // Channex uses 0 for "no maximum".
+        max_stay: p.max_stay ?? 0,
+      }),
     ).map((r) => ({
       property_id: propertyId,
       rate_plan_id: r.key,
       ...dates(r),
       rate: r.value.rate,
       stop_sell: r.value.stop_sell,
+      closed_to_arrival: r.value.closed_to_arrival,
+      closed_to_departure: r.value.closed_to_departure,
       [minStayField]: r.value.min_stay,
+      max_stay: r.value.max_stay,
     }));
 
     return { availability, restrictions };

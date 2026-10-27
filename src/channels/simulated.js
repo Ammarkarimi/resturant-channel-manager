@@ -16,15 +16,18 @@ class SimulatedChannel extends ChannelAdapter {
     const now = new Date().toISOString();
     const upsert = db.prepare(`
       INSERT INTO channel_listings
-        (channel_id, external_room_id, date, available, rate, closed, min_stay, synced_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT (channel_id, external_room_id, date) DO UPDATE SET
-        available = excluded.available, rate = excluded.rate, closed = excluded.closed,
-        min_stay = excluded.min_stay, synced_at = excluded.synced_at
+        (channel_id, external_room_id, external_rate_plan_id, date, available, rate, closed, cta, ctd, min_stay, max_stay, synced_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (channel_id, external_rate_plan_id, date) DO UPDATE SET
+        external_room_id = excluded.external_room_id, available = excluded.available, rate = excluded.rate,
+        closed = excluded.closed, cta = excluded.cta, ctd = excluded.ctd, min_stay = excluded.min_stay,
+        max_stay = excluded.max_stay, synced_at = excluded.synced_at
     `);
     for (const u of updates) {
-      upsert.run(this.channel.id, u.external_room_id, u.date, u.available, u.rate,
-        u.closed ? 1 : 0, u.min_stay, now);
+      for (const p of u.plans) {
+        upsert.run(this.channel.id, u.external_room_id, p.external_rate_plan_id, u.date, u.available, p.rate,
+          p.closed ? 1 : 0, p.cta ? 1 : 0, p.ctd ? 1 : 0, p.min_stay, p.max_stay, now);
+      }
     }
   }
 }
