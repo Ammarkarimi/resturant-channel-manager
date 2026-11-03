@@ -323,3 +323,5 @@ dialog fieldset { display: grid; gap: .4rem; }
   .plot { height: 170px; }
   .filters { flex-direction: column; align-items: stretch; }
 }
+
+#provider .alert ul { margin: .35rem 0 0; padding-left: 1.2rem; font-weight: 400; }

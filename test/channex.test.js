@@ -184,7 +184,7 @@ test('bookings from Channex: new, modified and cancelled keep the calendar right
 
   fake.state.revisions.push(revision('rev-1', 'new', D0, addDays(D0, 2)));
   let pulled = await api('POST', '/api/providers/channex/pull');
-  assert.deepEqual(pulled.body, { processed: 1 });
+  assert.deepEqual(pulled.body, { processed: 1, failed: 0 });
   assert.equal(fake.state.revisions[0].acked, true);
   assert.deepEqual([avail(1, D0), avail(1, addDays(D0, 1)), avail(1, addDays(D0, 2))], [8, 8, undefined]);
 
@@ -211,7 +211,7 @@ test('bookings from Channex: new, modified and cancelled keep the calendar right
   pulled = await api('POST', '/api/providers/channex/pull');
   assert.equal(pulled.status, 502);
   pulled = await api('POST', '/api/providers/channex/pull');
-  assert.deepEqual(pulled.body, { processed: 0 }, 'already applied, only acknowledged');
+  assert.deepEqual(pulled.body, { processed: 0, failed: 0 }, 'already applied, only acknowledged');
   assert.equal(fake.state.revisions[2].acked, true);
   assert.deepEqual([avail(1, D0), avail(1, addDays(D0, 1)), avail(1, addDays(D0, 2))], [10, 10, 10]);
   assert.equal((await api('GET', '/api/bookings')).body[0].status, 'cancelled');
@@ -267,4 +267,115 @@ test('rejects mappings Channex could not price', async () => {
 test('a wrong API key is reported clearly', async () => {
   const client = new ChannexClient({ apiKey: 'wrong', baseUrl: `http://127.0.0.1:${fakeServer.address().port}/api/v1` });
   await assert.rejects(client.listProperties(), /rejected the API key/);
+});
+
+// ---------- Robustness: failing revisions, recovery, stalls, health check ----------
+
+const revision = (id, bookingId, attrs = {}) => ({
+  id,
+  acked: false,
+  attributes: {
+    booking_id: bookingId, status: 'new', ota_name: 'Booking.com', ota_reservation_code: `BDC-${bookingId}`,
+    arrival_date: D0, departure_date: addDays(D0, 1), amount: '5000.00', currency: 'INR',
+    customer: { name: 'Guest', surname: bookingId },
+    rooms: [{ room_type_id: 'rt-dlx', rate_plan_id: 'rp-dlx', checkin_date: D0, checkout_date: addDays(D0, 1) }],
+    ...attrs,
+  },
+});
+
+test('a revision that cannot be saved does not hold up the others, even past one feed page', async () => {
+  await connect();
+  // 11 broken revisions first (more than a feed page), then a good one.
+  for (let i = 0; i < 11; i += 1) fake.state.revisions.push(revision(`bad-${i}`, `b${i}`, { arrival_date: 'not-a-date' }));
+  fake.state.revisions.push(revision('good-1', 'g1'));
+
+  const r = await api('POST', '/api/providers/channex/pull');
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, { processed: 1, failed: 11 });
+  assert.equal(fake.state.revisions.find((x) => x.id === 'good-1').acked, true);
+  assert.ok(fake.state.revisions.filter((x) => x.id.startsWith('bad')).every((x) => !x.acked), 'failed ones stay in the feed');
+  assert.equal(avail(1, D0), 9);
+
+  const alerts = (await api('GET', '/api/alerts')).body;
+  assert.ok(alerts.some((a) => a.level === 'error' && /11 booking update\(s\) from Channex could not be saved/.test(a.text)));
+
+  // Fixed on the Channex side: it applies on the next pull and the alert goes.
+  for (const x of fake.state.revisions) if (x.id.startsWith('bad')) x.attributes.arrival_date = D0;
+  assert.deepEqual((await api('POST', '/api/providers/channex/pull')).body, { processed: 11, failed: 0 });
+  assert.equal((await api('GET', '/api/providers/channex')).body.failures.length, 0);
+  assert.ok(!(await api('GET', '/api/alerts')).body.some((a) => /could not be saved/.test(a.text)));
+});
+
+test('the OTA reservation number is kept, shown and searchable', async () => {
+  await connect();
+  fake.state.revisions.push(revision('rev-ota', 'bk-77', { ota_reservation_code: '4455667788' }));
+  await api('POST', '/api/providers/channex/pull');
+  const [b] = (await api('GET', '/api/bookings?q=44556677')).body;
+  assert.equal(b.ota_reference, '4455667788');
+  assert.equal((await api('GET', `/api/bookings/${b.id}`)).body.ota_reference, '4455667788');
+  const csv = await api('GET', `/api/reports/export.csv?type=bookings&from=${D0}&to=${D0}`);
+  assert.match(csv.body, /4455667788/);
+});
+
+test('recovery after an outage brings in missed bookings and cancellations, once', async () => {
+  await connect();
+  // One booking we already have, then the outage: a new booking and a cancellation never reached the feed.
+  fake.state.revisions.push(revision('rev-a', 'bk-a'));
+  await api('POST', '/api/providers/channex/pull');
+  const since = new Date(Date.now() - 3600_000).toISOString();
+  const later = new Date().toISOString();
+  fake.state.bookings.push(
+    { id: 'bk-a', inserted_at: later, attributes: { ...revision('x', 'bk-a').attributes, status: 'cancelled' } },
+    { id: 'bk-b', inserted_at: later, attributes: revision('y', 'bk-b', { arrival_date: addDays(D0, 2), departure_date: addDays(D0, 3),
+      rooms: [{ room_type_id: 'rt-ste', checkin_date: addDays(D0, 2), checkout_date: addDays(D0, 3) }] }).attributes },
+    { id: 'bk-old', inserted_at: '2000-01-01T00:00:00Z', attributes: revision('z', 'bk-old').attributes },
+  );
+
+  const r = await api('POST', '/api/providers/channex/recover', { since });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.deepEqual(r.body, { checked: 2, created: 1, updated: 1, unchanged: 0, failed: [] });
+  assert.equal(avail(1, D0), 10, 'cancelled booking released');
+  assert.equal(avail(3, addDays(D0, 2)), 1, 'missed booking taken');
+
+  const again = await api('POST', '/api/providers/channex/recover', { since });
+  assert.deepEqual(again.body, { checked: 2, created: 0, updated: 0, unchanged: 2, failed: [] });
+  assert.equal((await api('POST', '/api/providers/channex/recover', { since: 'yesterday-ish' })).status, 400);
+});
+
+test('an alert appears when bookings have not been fetched for a while', async () => {
+  await connect();
+  await api('POST', '/api/providers/channex/pull');
+  const set = (min) => db.prepare("UPDATE channels SET last_pull_ok_at = ? WHERE kind = 'channex'").run(new Date(Date.now() - min * 60_000).toISOString());
+  set(2);
+  assert.ok(!(await api('GET', '/api/alerts')).body.some((a) => /haven't been fetched/.test(a.text)));
+  set(15);
+  assert.ok((await api('GET', '/api/alerts')).body.some((a) => a.level === 'warn' && /15 min/.test(a.text)));
+  set(45);
+  assert.ok((await api('GET', '/api/alerts')).body.some((a) => a.level === 'error' && /may have been missed/.test(a.text)));
+});
+
+test('health check reads values back from Channex and spots differences', async () => {
+  await connect();
+  await api('POST', '/api/providers/channex/pull');
+  let r = (await api('GET', '/api/providers/channex/doctor?days=7')).body;
+  const byKey = Object.fromEntries(r.checks.map((c) => [c.key, c]));
+  assert.equal(r.ok, true, JSON.stringify(r.checks));
+  assert.equal(byKey.readback.status, 'ok');
+  assert.match(byKey.readback.detail, /21 room-night\(s\) match/);
+  assert.equal(byKey.mapping.status, 'warn', 'demo plans 2, 4 and 6 are not mapped');
+
+  // Someone changed a price inside Channex.
+  fake.state.restrictions['rp-dlx'][D0].rate = '1.00';
+  delete fake.state.availability['rt-ste'][addDays(D0, 1)];
+  r = (await api('GET', '/api/providers/channex/doctor?days=7')).body;
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.mismatches.map((m) => m.what).sort(), ['Deluxe Room · Room only: price', 'Suite: rooms available']);
+  assert.equal(r.mismatches.find((m) => m.what.endsWith('price')).theirs, '1.00');
+
+  // Resend everything, and it matches again.
+  assert.equal((await api('POST', '/api/providers/channex/resync')).status, 200);
+  await sleep(220);
+  await drain();
+  r = (await api('GET', '/api/providers/channex/doctor?days=7')).body;
+  assert.equal(r.ok, true, JSON.stringify(r.mismatches));
 });

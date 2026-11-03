@@ -5,7 +5,7 @@
 //             │             └─ inventory (rooms left per night)
 //             └─ channel (an OTA, a provider such as Channex, or "direct")
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS properties (
@@ -109,6 +109,8 @@ CREATE TABLE IF NOT EXISTS channels (
   rate_markup_pct REAL NOT NULL DEFAULT 0,
   -- Demo switch: makes the simulated OTA reject pushes so retries can be seen.
   simulate_outage INTEGER NOT NULL DEFAULT 0,
+  -- Providers: when bookings were last fetched successfully.
+  last_pull_ok_at TEXT,
   UNIQUE (property_id, code)
 );
 
@@ -189,6 +191,7 @@ CREATE TABLE IF NOT EXISTS bookings (
   guest_name TEXT,
   guest_email TEXT,
   guest_phone TEXT,
+  ota_reference TEXT,                        -- the OTA's own reservation number
   total REAL,
   currency TEXT,
   status TEXT NOT NULL DEFAULT 'confirmed',  -- confirmed | cancelled
@@ -261,6 +264,20 @@ CREATE TABLE IF NOT EXISTS activity (
 
 -- Provider booking revisions already applied, so a re-delivered one is not
 -- counted twice (e.g. when the acknowledgement to Channex failed).
+-- Provider booking revisions that could not be applied yet. They are left
+-- unacknowledged so the provider sends them again, and raise an alert:
+-- Channex stops re-sending after about 30 minutes.
+CREATE TABLE IF NOT EXISTS provider_failures (
+  channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+  revision_id TEXT NOT NULL,
+  booking_ref TEXT,
+  error TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 1,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  PRIMARY KEY (channel_id, revision_id)
+);
+
 CREATE TABLE IF NOT EXISTS provider_revisions (
   channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
   revision_id TEXT NOT NULL,

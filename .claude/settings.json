@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "channex-skills": {
+      "source": {
+        "source": "github",
+        "repo": "daviesevan-svg/channex-claude-skill"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "channex-pms-integration@channex-skills": true
+  }
+}

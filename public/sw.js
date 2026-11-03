@@ -1,7 +1,7 @@
 // App shell for the installable app. Pages and scripts come from the network
 // when it's available (so updates show up at once) and from the cache when
 // it isn't. API calls are never cached: rates and bookings must be live.
-const CACHE = 'channel-manager-v3';
+const CACHE = 'channel-manager-v4';
 const SHELL = [
   '/', '/index.html', '/styles.css', '/manifest.webmanifest', '/voucher.html', '/voucher.css',
   '/js/core.js', '/js/charts.js', '/js/dashboard.js', '/js/calendar.js', '/js/bookings.js', '/js/channels.js',

@@ -2,7 +2,7 @@
 // trying the dashboard without a Channex account: `node test/fake-channex.js`).
 const assert = require('node:assert/strict');
 const express = require('express');
-const { today } = require('../src/dates');
+const { today, addDays, eachDate } = require('../src/dates');
 
 const API_KEY = 'test-key';
 
@@ -13,6 +13,10 @@ function fakeChannex() {
     warnNext: false,        // answer the next restrictions call with a warning
     revisions: [],          // { id, attributes, acked }
     failAckOnce: false,
+    bookings: [],           // { id, inserted_at, attributes } for GET /bookings
+    // What Channex now holds, as a real account would (filled by the ARI pushes).
+    availability: {},       // room type id -> date -> count
+    restrictions: {},       // rate plan id -> date -> { rate, stop_sell, ... }
   };
   const app = express();
   app.use(express.json({ limit: '10mb' }));
@@ -48,6 +52,24 @@ function fakeChannex() {
       const status = state.failNext.shift();
       if (status) return res.status(status).json({ errors: { code: 'x', title: 'Failure' } });
       state.calls.push({ kind, values: req.body.values });
+      for (const v of req.body.values) {
+        const dates = v.date ? [v.date] : eachDate(v.date_from, v.date_to);
+        for (const d of dates) {
+          if (kind === 'availability') {
+            (state.availability[v.room_type_id] ||= {})[d] = v.availability;
+          } else {
+            const cell = ((state.restrictions[v.rate_plan_id] ||= {})[d] ||= {});
+            // Channex applies partial updates; reads give rates as strings and
+            // the property's min-stay type as min_stay_arrival.
+            for (const [k, val] of Object.entries(v)) {
+              if (['property_id', 'rate_plan_id', 'date', 'date_from', 'date_to'].includes(k)) continue;
+              if (k === 'rate') cell.rate = Number(val).toFixed(2);
+              else if (k === 'min_stay') cell.min_stay_arrival = val;
+              else cell[k] = val;
+            }
+          }
+        }
+      }
       if (kind === 'restrictions' && state.warnNext) {
         state.warnNext = false;
         return res.json({ data: [], meta: { message: 'Success', warnings: [{ date: today(), warning: { rate: ['must be greater than 0'] } }] } });
@@ -55,8 +77,38 @@ function fakeChannex() {
       return res.json({ data: [{ id: 'task', type: 'task' }], meta: { message: 'Success', warnings: [] } });
     });
   }
+  app.get('/api/v1/availability', (req, res) => {
+    const { gte, lte } = req.query.filter.date;
+    const out = {};
+    for (const [roomId, days] of Object.entries(state.availability)) {
+      out[roomId] = Object.fromEntries(Object.entries(days).filter(([d]) => d >= gte && d <= lte));
+    }
+    res.json({ data: out });
+  });
+  app.get('/api/v1/restrictions', (req, res) => {
+    if (!req.query.filter.restrictions) return res.status(400).json({ errors: { code: 'bad_request', title: 'Bad Request', details: ['restrictions is required'] } });
+    const { gte, lte } = req.query.filter.date;
+    const fields = req.query.filter.restrictions.split(',');
+    const out = {};
+    for (const [planId, days] of Object.entries(state.restrictions)) {
+      out[planId] = Object.fromEntries(Object.entries(days).filter(([d]) => d >= gte && d <= lte)
+        .map(([d, cell]) => [d, Object.fromEntries(fields.map((f) => [f, cell[f] ?? null]))]));
+    }
+    res.json({ data: out });
+  });
+  // Oldest first, 10 per page, unacknowledged only.
   app.get('/api/v1/booking_revisions/feed', (req, res) => {
-    res.json({ data: state.revisions.filter((r) => !r.acked).slice(0, 10).map((r) => ({ type: 'booking_revision', id: r.id, attributes: r.attributes })) });
+    const p = Number(req.query.pagination?.page || 1);
+    const open = state.revisions.filter((r) => !r.acked);
+    res.json({
+      data: open.slice((p - 1) * 10, p * 10).map((r) => ({ type: 'booking_revision', id: r.id, attributes: r.attributes })),
+      meta: { page: p, limit: 10, total: open.length },
+    });
+  });
+  app.get('/api/v1/bookings', (req, res) => {
+    const since = req.query.filter.inserted_at.gte;
+    const found = state.bookings.filter((b) => b.inserted_at >= since).map((b) => ({ type: 'booking', id: b.id, attributes: b.attributes }));
+    res.json(page(found, req));
   });
   app.post('/api/v1/booking_revisions/:id/ack', (req, res) => {
     if (state.failAckOnce) {

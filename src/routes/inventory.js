@@ -93,6 +93,7 @@ function inventoryRoutes({ db, engine, channex }) {
     }
 
     const cx = channex.status(req.property.id);
+    alerts.push(...channex.alerts(req.property.id));
     if (cx.connected) {
       if (cx.last_pull.ok === false) {
         alerts.push({ level: 'error', page: 'channels', text: `Couldn't fetch bookings from Channex: ${cx.last_pull.error}` });

@@ -78,6 +78,7 @@ function applyReservation(db, channel, res, { stopSellCounts = true } = {}) {
       guest_name: res.guest_name ?? null,
       guest_email: res.guest_email ?? null,
       guest_phone: res.guest_phone ?? null,
+      ota_reference: res.ota_reference ?? null,
       total: res.total == null || Number.isNaN(res.total) ? null : Number(res.total),
       currency: res.currency ?? null,
       status: res.status,
@@ -314,7 +315,7 @@ function listBookings(db, propertyId, { view = 'all', q = '', limit = 200 } = {}
     WHERE c.property_id = :property AND ${where}
       AND (:q = '' OR lower(coalesce(b.guest_name, '')) LIKE :like OR lower(b.external_ref) LIKE :like
            OR lower(coalesce(b.source, '')) LIKE :like OR lower(coalesce(b.guest_phone, '')) LIKE :like
-           OR lower(coalesce(b.guest_email, '')) LIKE :like)
+           OR lower(coalesce(b.guest_email, '')) LIKE :like OR lower(coalesce(b.ota_reference, '')) LIKE :like)
     ORDER BY ${['upcoming', 'arrivals', 'inhouse', 'departures'].includes(view) ? 'b.check_in ASC, b.id ASC' : 'b.updated_at DESC, b.id DESC'}
     LIMIT :limit
   `).all({ property: propertyId, ...(where.includes(':today') ? { today: today() } : {}), q: search, like: `%${search}%`, limit });

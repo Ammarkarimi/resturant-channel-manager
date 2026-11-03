@@ -123,8 +123,13 @@ function renderProvider() {
           <td>${esc(m.channex_room_type_title || m.channex_room_type_id)}</td><td>${plansFor(m.room_type_id)}</td></tr>`).join('')}
       </tbody></table></div>
       <p class="muted small">Last booking check: ${pullText}</p>
+      ${s.failures.length ? `<div class="alert error">⚠ ${s.failures.length} booking update(s) could not be saved and are waiting in Channex's feed
+        (Channex keeps re-sending them for about 30 minutes):
+        <ul>${s.failures.slice(0, 5).map((f) => `<li>${esc(f.booking_ref || f.revision_id)}: ${esc(f.error)} <span class="muted small">(since ${timeAgo(f.first_seen_at)}, ${f.attempts} tries)</span></li>`).join('')}</ul></div>` : ''}
       ${manage ? `<div class="actions">
         <button id="pv-pull">Check for new bookings</button>
+        <button id="pv-doctor">Run health check</button>
+        <button id="pv-recover">Recover bookings…</button>
         <button id="pv-edit">Change mapping</button>
         <button id="pv-disconnect" class="danger">Disconnect</button>
         <span id="pv-msg" class="msg" role="status"></span>
@@ -189,7 +194,14 @@ async function renderProviderEditor() {
 function fillPlans(fs) {
   const roomId = $('.pv-room', fs).value;
   const plans = provider.rooms.rate_plans.filter((p) => p.room_type_id === roomId);
-  for (const lab of $$('.map-plan', fs)) {
+  const labels = $$('.map-plan', fs);
+  // Nothing mapped yet for this room: start by selling its first plan
+  // through the first usable Channex plan, which is the usual setup.
+  const firstUsable = plans.find((p) => p.usable);
+  if (firstUsable && labels.length && !labels.some((l) => plans.some((p) => p.id === l.dataset.current))) {
+    labels[0].dataset.current = firstUsable.id;
+  }
+  for (const lab of labels) {
     const cur = lab.dataset.current;
     $('.pv-plan', lab).innerHTML = options(plans.map((p) => [p.id, p.usable ? p.title : `${p.title} (${p.sell_mode}, ${p.rate_mode}: not supported)`, !p.usable]),
       plans.some((p) => p.id === cur && p.usable) ? cur : '', { empty: "Don't send" });
@@ -239,12 +251,66 @@ $('#provider-body').addEventListener('click', async (e) => {
     await refreshStatus();
     renderChannels();
   }
+  if (id === 'pv-doctor') {
+    e.target.disabled = true;
+    try {
+      const r = await api('GET', '/api/providers/channex/doctor');
+      const icon = { ok: '<span class="status good">✓</span>', warn: '<span class="status warning">!</span>', fail: '<span class="status critical">✗</span>' };
+      openDialog({
+        title: r.ok ? 'Channex health check: all good' : 'Channex health check: needs attention',
+        wide: true,
+        body: `
+          <table class="list"><tbody>${r.checks.map((c) => `<tr><td>${icon[c.status]}</td><td><strong>${esc(c.label)}</strong><div class="muted small">${esc(c.detail)}</div></td></tr>`).join('')}</tbody></table>
+          ${r.mismatches.length ? `<h3>Differences between this app and Channex</h3>
+            <div class="scroll"><table class="list"><thead><tr><th>Night</th><th>What</th><th>Here</th><th>In Channex</th></tr></thead><tbody>
+            ${r.mismatches.slice(0, 30).map((m) => `<tr><td class="nowrap">${shortDate(m.date)}</td><td>${esc(m.what)}</td><td>${esc(m.ours)}</td><td>${esc(m.theirs)}</td></tr>`).join('')}
+            </tbody></table></div>
+            <div class="actions"><button type="button" id="pv-resync" class="primary">Resend everything to Channex</button></div>` : ''}
+          <p class="muted small">Checked ${timeAgo(r.checked_at)}. Prices and availability were read back from Channex, not taken on trust.</p>`,
+        onOpen: () => {
+          const btn = $('#pv-resync');
+          if (btn) {
+            btn.onclick = async () => {
+              await api('POST', '/api/providers/channex/resync');
+              $('#dialog').close();
+              await refreshStatus();
+              renderChannels();
+              flash($('#pv-msg'), 'Resending your calendar to Channex. Run the health check again in a minute.');
+            };
+          }
+        },
+      });
+    } catch (err) {
+      flash($('#pv-msg'), err.message, false);
+    } finally {
+      e.target.disabled = false;
+    }
+  }
+  if (id === 'pv-recover') {
+    const s = provider.status;
+    const from = s.last_pull_ok_at ? new Date(Date.parse(s.last_pull_ok_at) - 5 * 60_000) : new Date(Date.now() - 86_400_000);
+    const local = new Date(from.getTime() - from.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+    openDialog({
+      title: 'Recover bookings from Channex',
+      body: `
+        <p>Use this after the server was down or couldn't reach Channex for more than 30 minutes. Channex only re-sends
+          a booking for about 30 minutes, so bookings made during a longer gap need fetching again.</p>
+        <label>Fetch bookings made since <input type="datetime-local" name="since" value="${local}" required></label>
+        <p class="muted small">Bookings you already have are left as they are; missing ones are added and cancellations applied.</p>`,
+      saveLabel: 'Recover',
+      onSave: async (form) => {
+        const r = await api('POST', '/api/providers/channex/recover', { since: new Date(form.since.value).toISOString() });
+        await Promise.all([refreshStatus(), loadProvider()]);
+        flash($('#pv-msg'), `Checked ${r.checked} booking(s): ${r.created} added, ${r.updated} updated, ${r.unchanged} already here.${r.failed.length ? ` ${r.failed.length} failed: ${r.failed.map((f) => f.error).join('; ')}` : ''}`, r.failed.length === 0);
+      },
+    });
+  }
   if (id === 'pv-pull') {
     e.target.disabled = true;
     try {
       const r = await api('POST', '/api/providers/channex/pull');
       await Promise.all([refreshStatus(), loadProvider()]);
-      flash($('#pv-msg'), r.processed ? `${r.processed} booking update(s) received.` : 'No new bookings.');
+      flash($('#pv-msg'), `${r.processed ? `${r.processed} booking update(s) received.` : 'No new bookings.'}${r.failed ? ` ${r.failed} could not be saved; see above.` : ''}`, !r.failed);
     } catch (err) {
       await loadProvider();
       flash($('#pv-msg'), err.message, false);

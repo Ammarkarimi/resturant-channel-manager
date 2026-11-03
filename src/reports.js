@@ -327,8 +327,8 @@ function exportCsv(db, propertyId, type, from, to) {
              (SELECT GROUP_CONCAT(rt.name || ' x' || l.rooms, '; ') FROM booking_lines l JOIN room_types rt ON rt.id = l.room_type_id WHERE l.booking_id = b.id) AS rooms
       FROM bookings b JOIN channels c ON c.id = b.channel_id
       WHERE c.property_id = ? AND b.check_in BETWEEN ? AND ? ORDER BY b.check_in, b.id`).all(propertyId, range.from, range.to);
-    return toCsv(['Reference', 'Source', 'Status', 'Guest', 'Email', 'Phone', 'Check-in', 'Check-out', 'Rooms', 'Total', 'Currency', 'Overbooked', 'Booked at', 'Notes'],
-      rows.map((b) => [b.external_ref, sourceOf(b), b.status, b.guest_name, b.guest_email, b.guest_phone, b.check_in, b.check_out, b.rooms,
+    return toCsv(['Reference', 'OTA reference', 'Source', 'Status', 'Guest', 'Email', 'Phone', 'Check-in', 'Check-out', 'Rooms', 'Total', 'Currency', 'Overbooked', 'Booked at', 'Notes'],
+      rows.map((b) => [b.external_ref, b.ota_reference, sourceOf(b), b.status, b.guest_name, b.guest_email, b.guest_phone, b.check_in, b.check_out, b.rooms,
         b.total, b.currency, b.overbooked ? 'yes' : '', b.created_at, b.notes]));
   }
   if (type === 'occupancy') {

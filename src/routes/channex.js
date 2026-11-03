@@ -58,6 +58,25 @@ function channexRoutes({ db, channex }) {
     res.json(result);
   });
 
+  // Health check: reads values back from Channex and compares them.
+  r.get('/providers/channex/doctor', manage, wrap(async (req, res) => {
+    res.json(await channex.doctor(req.property.id, { days: Number(req.query.days) || 14 }));
+  }));
+
+  // After an outage: fetch bookings made since a moment and apply any we missed.
+  r.post('/providers/channex/recover', manage, wrap(async (req, res) => {
+    const result = await channex.recover(req.property.id, req.body?.since);
+    log(req, `Recovered bookings from Channex since ${req.body.since}: ${result.created} new, ${result.updated} updated, ${result.unchanged} already here`);
+    res.json(result);
+  }));
+
+  // Send everything again (after the health check found differences).
+  r.post('/providers/channex/resync', manage, (req, res) => {
+    channex.resync(req.property.id);
+    log(req, 'Resent all rates and availability to Channex');
+    res.json({ ok: true });
+  });
+
   // Check for new bookings now (also runs on a timer).
   r.post('/providers/channex/pull', manage, wrap(async (req, res) => {
     res.json(await channex.pull(req.property.id));

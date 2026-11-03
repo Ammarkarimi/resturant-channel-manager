@@ -234,6 +234,33 @@ starts a stand-in API on port 4010. Then start the app with
 - **Demo channels:** connecting switches off the four demo OTAs. They are
   stand-ins that aren't needed once real OTAs are connected through Channex.
 
+### Keeping it healthy
+
+Channex re-sends an unacknowledged booking for only about **30 minutes**,
+then it leaves the feed for good. The app guards against losing bookings
+that way:
+
+- **A booking that can't be saved doesn't block the others.** It stays
+  unacknowledged (so Channex keeps re-sending it) and appears in red on
+  the Channex card and in the alert banner, with the error. The bookings
+  behind it are still processed.
+- **Stall alerts:** if bookings haven't been fetched for 10 minutes the
+  banner warns; after 30 minutes it says bookings may have been missed.
+- **Recover bookings…** (Channex card): after an outage, fetches every
+  booking Channex received since a given time and adds what's missing
+  (or applies cancellations). Bookings already here are left alone. It's
+  a one-off tool on purpose; the feed stays the normal path.
+- **Run health check** (Channex card, or `npm run doctor` from cron/CI,
+  which exits 1 on failure): checks the API key, the connection,
+  mappings, the send queue and the booking feed. It also **reads prices,
+  availability and restrictions back from Channex** for the next 14
+  nights and compares them with this app, so problems show up instead of
+  being hidden behind a "200 OK". If they differ, **Resend everything to
+  Channex** queues a full resync.
+- The OTA's own **reservation number** (e.g. the Booking.com number) is
+  stored with each booking, shown on the booking, the voucher and the
+  CSV export, and searchable.
+
 ### Things to know about Channex
 
 - Channex sells to **software companies (PMS / channel-manager builders)**,

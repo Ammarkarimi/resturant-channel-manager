@@ -3,17 +3,13 @@ const { applyReservation } = require('../../bookings');
 const { isValidDate } = require('../../dates');
 
 /**
- * Apply one Channex booking revision (new / modified / cancelled) to our
- * calendar. Each revision carries the full current state of the booking, so
- * it simply replaces whatever we held for that booking before.
- *
- * Returns false when this revision was already applied.
+ * Apply the current state of a Channex booking to our calendar. Used for
+ * booking revisions from the feed and for bookings fetched when recovering
+ * after an outage. `attrs` has the shape Channex uses for both: status,
+ * arrival/departure, customer, rooms[], ota_name, ota_reservation_code, ...
+ * Each call replaces whatever we held for that booking before.
  */
-function applyRevision(db, channel, revisionId, rev) {
-  const seen = db.prepare('SELECT 1 FROM provider_revisions WHERE channel_id = ? AND revision_id = ?')
-    .get(channel.id, revisionId);
-  if (seen) return false;
-
+function applyBookingState(db, channel, bookingId, attrs) {
   const mapping = db.prepare(
     'SELECT room_type_id FROM channel_room_mappings WHERE channel_id = ? AND external_room_id = ?'
   );
@@ -22,10 +18,10 @@ function applyRevision(db, channel, revisionId, rev) {
   );
   const lines = [];
   const problems = [];
-  for (const room of rev.rooms || []) {
+  for (const room of attrs.rooms || []) {
     const m = room.room_type_id && mapping.get(channel.id, room.room_type_id);
-    const checkIn = room.checkin_date || rev.arrival_date;
-    const checkOut = room.checkout_date || rev.departure_date;
+    const checkIn = room.checkin_date || attrs.arrival_date;
+    const checkOut = room.checkout_date || attrs.departure_date;
     if (!m) {
       problems.push(`room type ${room.room_type_id || '(unmapped on the OTA)'} is not mapped here`);
     } else if (!isValidDate(checkIn) || !isValidDate(checkOut) || checkOut <= checkIn) {
@@ -44,32 +40,60 @@ function applyRevision(db, channel, revisionId, rev) {
       });
     }
   }
-  if ((rev.rooms || []).length === 0) problems.push('no rooms in booking');
+  if ((attrs.rooms || []).length === 0) problems.push('no rooms in booking');
+  if (!isValidDate(attrs.arrival_date) || !isValidDate(attrs.departure_date)) {
+    throw new Error(`Booking ${bookingId} has no valid arrival/departure dates`);
+  }
 
-  const customer = rev.customer || {};
+  const customer = attrs.customer || {};
   const guest = [customer.name, customer.surname].filter(Boolean).join(' ') || null;
 
+  return applyReservation(db, channel, {
+    external_ref: bookingId,
+    status: attrs.status === 'cancelled' ? 'cancelled' : 'confirmed',
+    source: attrs.ota_name || null,
+    ota_reference: attrs.ota_reservation_code || null,
+    check_in: attrs.arrival_date,
+    check_out: attrs.departure_date,
+    guest_name: guest,
+    guest_email: customer.mail || null,
+    guest_phone: customer.phone || null,
+    total: attrs.amount == null ? null : Number(attrs.amount),
+    currency: attrs.currency || null,
+    lines,
+    needs_attention: problems.length && attrs.status !== 'cancelled'
+      ? `Check this booking in Channex: ${problems.join('; ')}`
+      : null,
+  });
+}
+
+/**
+ * Apply one Channex booking revision (new / modified / cancelled). Returns
+ * false when this revision was already applied. Throws if it can't be
+ * applied; the caller leaves it unacknowledged so Channex sends it again.
+ */
+function applyRevision(db, channel, revisionId, rev) {
+  const seen = db.prepare('SELECT 1 FROM provider_revisions WHERE channel_id = ? AND revision_id = ?')
+    .get(channel.id, revisionId);
+  if (seen) return false;
   transaction(db, () => {
-    applyReservation(db, channel, {
-      external_ref: rev.booking_id || revisionId,
-      status: rev.status === 'cancelled' ? 'cancelled' : 'confirmed',
-      source: rev.ota_name || null,
-      check_in: rev.arrival_date,
-      check_out: rev.departure_date,
-      guest_name: guest,
-      guest_email: customer.mail || null,
-      guest_phone: customer.phone || null,
-      total: rev.amount == null ? null : Number(rev.amount),
-      currency: rev.currency || null,
-      lines,
-      needs_attention: problems.length && rev.status !== 'cancelled'
-        ? `Check this booking in Channex: ${problems.join('; ')}`
-        : null,
-    });
+    applyBookingState(db, channel, rev.booking_id || revisionId, rev);
     db.prepare('INSERT INTO provider_revisions (channel_id, revision_id, processed_at) VALUES (?, ?, ?)')
       .run(channel.id, revisionId, new Date().toISOString());
+    db.prepare('DELETE FROM provider_failures WHERE channel_id = ? AND revision_id = ?').run(channel.id, revisionId);
   });
   return true;
 }
 
-module.exports = { applyRevision };
+/** Remember a revision that failed, for the alert banner. */
+function recordFailure(db, channel, revisionId, rev, error) {
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO provider_failures (channel_id, revision_id, booking_ref, error, first_seen_at, last_seen_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT (channel_id, revision_id) DO UPDATE SET
+      error = excluded.error, attempts = provider_failures.attempts + 1, last_seen_at = excluded.last_seen_at
+  `).run(channel.id, revisionId, rev?.ota_reservation_code || rev?.booking_id || null, String(error.message || error).slice(0, 500), now, now);
+}
+
+module.exports = { applyRevision, applyBookingState, recordFailure };

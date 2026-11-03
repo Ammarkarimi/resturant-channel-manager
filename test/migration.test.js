@@ -7,6 +7,7 @@ const { DatabaseSync } = require('node:sqlite');
 const { openDb } = require('../src/db');
 const { listBookings } = require('../src/bookings');
 const { upgradeToV2 } = require('../src/migrations/legacy');
+const { SCHEMA_VERSION } = require('../src/schema');
 
 test('a database from the first version is upgraded without losing bookings', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-migrate-'));
@@ -74,7 +75,7 @@ test('a single-hotel database (v2) becomes property 1 with rate plans, keeping r
 
     const db = openDb(file);
     const one = (sql, ...a) => db.prepare(sql).get(...a);
-    assert.equal(one('PRAGMA user_version').user_version, 3);
+    assert.equal(one('PRAGMA user_version').user_version, SCHEMA_VERSION);
     assert.deepEqual({ ...one('SELECT property_id, code, total_rooms FROM room_types WHERE id = 1') }, { property_id: 1, code: 'DLX', total_rooms: 10 });
     assert.deepEqual(db.prepare('SELECT room_type_id, code, rate_double FROM rate_plans ORDER BY id').all().map((r) => ({ ...r })),
       [{ room_type_id: 1, code: 'EP', rate_double: 4500 }, { room_type_id: 2, code: 'EP', rate_double: 9000 }]);
@@ -87,6 +88,7 @@ test('a single-hotel database (v2) becomes property 1 with rate plans, keeping r
     assert.equal(one('SELECT property_id FROM activity').property_id, 1);
     assert.ok(one("SELECT COUNT(*) AS n FROM sync_queue WHERE channel_id = 2").n > 0, 'channels get a fresh full sync');
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
+    assert.ok(db.prepare('PRAGMA table_info(bookings)').all().some((c) => c.name === 'ota_reference'));
     db.close();
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

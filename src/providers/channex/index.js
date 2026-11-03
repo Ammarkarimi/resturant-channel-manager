@@ -1,10 +1,17 @@
 const { transaction } = require('../../db');
 const { queueFullResync } = require('../../queue');
 const { badRequest } = require('../../errors');
-const { applyRevision } = require('./revisions');
+const { applyRevision, applyBookingState, recordFailure } = require('./revisions');
+const { channelUpdate } = require('../../sync');
+const { Pricer } = require('../../pricing');
+const { addDays, today, eachDate } = require('../../dates');
 
 const CODE = 'channex';
 const MAX_FEED_PAGES = 50; // safety stop: 50 pages x 10 revisions per pull
+// Channex re-sends an unacknowledged booking for about 30 minutes, then it
+// leaves the feed for good. Warn well before that.
+const FEED_WINDOW_MIN = 30;
+const STALL_WARN_MIN = 10;
 
 /**
  * Everything specific to running hotels through Channex: connecting each of
@@ -66,6 +73,11 @@ class ChannexService {
       rooms,
       rate_plans: plans,
       last_pull: this.lastPull.get(propertyId) || { at: null, ok: null, processed: 0, error: null },
+      last_pull_ok_at: channel?.last_pull_ok_at ?? null,
+      failures: channel
+        ? this.db.prepare(`SELECT revision_id, booking_ref, error, attempts, first_seen_at, last_seen_at
+                           FROM provider_failures WHERE channel_id = ? ORDER BY first_seen_at`).all(channel.id)
+        : [],
     };
   }
 
@@ -149,7 +161,7 @@ class ChannexService {
       const db = this.db;
       let channel = this.channel(ourPropertyId);
       if (channel) {
-        db.prepare('UPDATE channels SET enabled = 1, config = ? WHERE id = ?').run(config, channel.id);
+        db.prepare('UPDATE channels SET enabled = 1, config = ?, last_pull_ok_at = NULL WHERE id = ?').run(config, channel.id);
       } else {
         db.prepare(`INSERT INTO channels (property_id, code, name, kind, config, enabled, rate_markup_pct)
                     VALUES (?, ?, 'Channex', 'channex', ?, 1, 0)`).run(ourPropertyId, CODE, config);
@@ -206,13 +218,16 @@ class ChannexService {
     const channels = this.db.prepare("SELECT * FROM channels WHERE kind = 'channex' AND enabled = 1 AND (? IS NULL OR property_id = ?)")
       .all(propertyId, propertyId);
     let processed = 0;
+    let failed = 0;
     for (const channel of channels) {
       if (!this.running.has(channel.id)) {
         this.running.set(channel.id, this.pullOnce(channel).finally(() => this.running.delete(channel.id)));
       }
-      processed += (await this.running.get(channel.id)).processed;
+      const r = await this.running.get(channel.id);
+      processed += r.processed;
+      failed += r.failed || 0;
     }
-    return { processed };
+    return { processed, failed };
   }
 
   async pullOnce(channel) {
@@ -220,25 +235,220 @@ class ChannexService {
     if (!this.client || !config.property_id) return { processed: 0, skipped: true };
 
     let processed = 0;
+    const failedIds = new Set();
     try {
-      for (let page = 0; page < MAX_FEED_PAGES; page += 1) {
-        const revisions = await this.client.bookingFeed(config.property_id);
+      // Revisions come oldest first. One that can't be applied stays in the
+      // feed (unacknowledged, so Channex sends it again), but must not hold
+      // up the ones behind it: when a whole page made no progress, move on
+      // to the next page.
+      let page = 1;
+      for (let i = 0; i < MAX_FEED_PAGES; i += 1) {
+        const revisions = await this.client.bookingFeed(config.property_id, page);
         if (revisions.length === 0) break;
+        let acked = 0;
         for (const r of revisions) {
-          if (applyRevision(this.db, channel, r.id, r.attributes || {})) processed += 1;
+          if (failedIds.has(r.id)) continue; // already tried in this pull
+          try {
+            if (applyRevision(this.db, channel, r.id, r.attributes || {})) processed += 1;
+          } catch (err) {
+            failedIds.add(r.id);
+            recordFailure(this.db, channel, r.id, r.attributes, err);
+            console.error(`Channex booking revision ${r.id} could not be applied: ${err.message}`);
+            continue;
+          }
           // Acknowledge only after it is safely stored; if this fails, the
           // revision comes back next time and is skipped as already applied.
           await this.client.ackRevision(r.id);
+          acked += 1;
         }
+        if (acked === 0) page += 1;
       }
-      this.lastPull.set(channel.property_id, { at: new Date().toISOString(), ok: true, processed, error: null });
+      const now = new Date().toISOString();
+      this.db.prepare('UPDATE channels SET last_pull_ok_at = ? WHERE id = ?').run(now, channel.id);
+      this.lastPull.set(channel.property_id, { at: now, ok: true, processed, failed: failedIds.size, error: null });
     } catch (err) {
-      this.lastPull.set(channel.property_id, { at: new Date().toISOString(), ok: false, processed, error: err.message });
+      this.lastPull.set(channel.property_id, { at: new Date().toISOString(), ok: false, processed, failed: failedIds.size, error: err.message });
       throw err;
     } finally {
       if (processed > 0) this.onChange();
     }
-    return { processed };
+    return { processed, failed: failedIds.size };
+  }
+
+  /**
+   * After an outage longer than the feed's 30-minute window: fetch every
+   * booking Channex received since `since` and apply any we are missing or
+   * hold differently (status or dates). One-off and time-scoped on purpose;
+   * the feed stays the normal path.
+   */
+  async recover(propertyId, since) {
+    const client = this.requireClient();
+    const channel = this.channel(propertyId);
+    const config = channel ? JSON.parse(channel.config || '{}') : {};
+    if (!channel?.enabled || !config.property_id) throw badRequest('Connect Channex first');
+    const t = Date.parse(since);
+    if (!since || Number.isNaN(t)) throw badRequest('Give the time to recover from, e.g. 2026-11-01T08:00');
+    if (t > Date.now()) throw badRequest('That time is in the future');
+    if (Date.now() - t > 90 * 86_400_000) throw badRequest('Recovery covers at most the last 90 days');
+    const from = new Date(t).toISOString();
+
+    const items = await client.listBookings(config.property_id, from);
+    const local = this.db.prepare('SELECT status, check_in, check_out FROM bookings WHERE channel_id = ? AND external_ref = ?');
+    const result = { checked: items.length, created: 0, updated: 0, unchanged: 0, failed: [] };
+    for (const item of items) {
+      const attrs = item.attributes || {};
+      const bookingId = attrs.booking_id || attrs.id || item.id;
+      const ours = local.get(channel.id, bookingId);
+      const status = attrs.status === 'cancelled' ? 'cancelled' : 'confirmed';
+      if (ours && ours.status === status && ours.check_in === attrs.arrival_date && ours.check_out === attrs.departure_date) {
+        result.unchanged += 1;
+        continue;
+      }
+      try {
+        transaction(this.db, () => applyBookingState(this.db, channel, bookingId, attrs));
+        if (ours) result.updated += 1; else result.created += 1;
+      } catch (err) {
+        result.failed.push({ booking: attrs.ota_reservation_code || bookingId, error: err.message });
+      }
+    }
+    if (result.created || result.updated) this.onChange();
+    await this.pull(propertyId).catch(() => {});
+    return result;
+  }
+
+  /** Alerts for the banner: revisions stuck unapplied, or the feed not checked for a while. */
+  alerts(propertyId) {
+    const s = this.status(propertyId);
+    if (!s.connected) return [];
+    const out = [];
+    const minutes = (iso) => Math.round((Date.now() - Date.parse(iso)) / 60_000);
+    if (s.failures.length) {
+      const oldest = minutes(s.failures[0].first_seen_at);
+      out.push({
+        level: 'error',
+        page: 'channels',
+        text: oldest >= FEED_WINDOW_MIN
+          ? `${s.failures.length} booking update(s) from Channex could not be saved for ${oldest} min and may have left the feed: fix the cause, then use "Recover bookings". Last error: ${s.failures.at(-1).error}`
+          : `${s.failures.length} booking update(s) from Channex could not be saved (${s.failures.at(-1).error}). Channex re-sends them for about ${FEED_WINDOW_MIN - oldest} more min.`,
+      });
+    }
+    if (s.last_pull_ok_at) {
+      const gap = minutes(s.last_pull_ok_at);
+      if (gap >= FEED_WINDOW_MIN) {
+        out.push({ level: 'error', page: 'channels', text: `Bookings haven't been fetched from Channex for ${gap} min; some may have been missed. Use "Recover bookings" from ${new Date(s.last_pull_ok_at).toLocaleString()}.` });
+      } else if (gap >= STALL_WARN_MIN) {
+        out.push({ level: 'warn', page: 'channels', text: `Bookings haven't been fetched from Channex for ${gap} min.` });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Health check. Doesn't trust "200 OK": reads availability, prices and
+   * restrictions back from Channex for the next `days` nights and compares
+   * them with what this app would send. Nights still queued for sending are
+   * skipped (they are expected to differ).
+   */
+  async doctor(propertyId, { days = 14 } = {}) {
+    const checks = [];
+    const add = (key, label, status, detail) => checks.push({ key, label, status, detail });
+    const mismatches = [];
+    const finish = () => ({ ok: !checks.some((c) => c.status === 'fail'), checked_at: new Date().toISOString(), checks, mismatches });
+
+    if (!this.client) { add('key', 'API key', 'fail', 'CHANNEX_API_KEY is not set'); return finish(); }
+    add('key', 'API key', 'ok', `${this.client.environment} (${this.client.baseUrl})`);
+    const channel = this.channel(propertyId);
+    const config = channel ? JSON.parse(channel.config || '{}') : {};
+    if (!channel?.enabled || !config.property_id) { add('connected', 'Connection', 'fail', 'This property is not connected to Channex'); return finish(); }
+
+    try {
+      const props = await this.client.listProperties();
+      if (props.some((p) => p.id === config.property_id)) add('reach', 'Channex reachable', 'ok', `Property "${config.property_title}" found`);
+      else { add('reach', 'Channex reachable', 'fail', 'The connected Channex property no longer exists in this account'); return finish(); }
+    } catch (err) {
+      add('reach', 'Channex reachable', 'fail', err.message);
+      return finish();
+    }
+
+    const db = this.db;
+    const unmappedRooms = db.prepare(`SELECT name FROM room_types WHERE property_id = ? AND id NOT IN
+      (SELECT room_type_id FROM channel_room_mappings WHERE channel_id = ?)`).all(propertyId, channel.id);
+    const unmappedPlans = db.prepare(`SELECT rt.name || ' · ' || rp.name AS name FROM rate_plans rp JOIN room_types rt ON rt.id = rp.room_type_id
+      WHERE rt.property_id = ? AND rp.active = 1 AND rp.id NOT IN (SELECT rate_plan_id FROM channel_rate_plan_mappings WHERE channel_id = ?)`).all(propertyId, channel.id);
+    add('mapping', 'Mapping', unmappedRooms.length || unmappedPlans.length ? 'warn' : 'ok',
+      unmappedRooms.length || unmappedPlans.length
+        ? `Not sent to Channex: ${[...unmappedRooms, ...unmappedPlans].map((r) => r.name).join(', ')}`
+        : 'Every room type and active rate plan is mapped');
+
+    const q = db.prepare(`SELECT SUM(status = 'pending') AS pending, SUM(status = 'failed') AS failed FROM sync_queue WHERE channel_id = ?`).get(channel.id);
+    add('queue', 'Updates waiting to send', q.failed ? 'fail' : q.pending ? 'warn' : 'ok',
+      q.failed ? `${q.failed} night(s) failed to send; use Retry failed` : q.pending ? `${q.pending} night(s) still being sent` : 'Nothing waiting');
+
+    try {
+      const feed = await this.client.bookingFeed(config.property_id);
+      const failures = this.status(propertyId).failures;
+      add('feed', 'Booking feed', failures.length ? 'fail' : 'ok',
+        failures.length ? `${failures.length} booking update(s) could not be saved: ${failures.at(-1).error}`
+          : `${feed.length ? `${feed.length} new booking update(s) waiting to be fetched` : 'No booking updates waiting'}`);
+    } catch (err) {
+      add('feed', 'Booking feed', 'fail', err.message);
+    }
+    const gap = channel.last_pull_ok_at ? Math.round((Date.now() - Date.parse(channel.last_pull_ok_at)) / 60_000) : null;
+    add('pulled', 'Last booking check', gap == null ? 'warn' : gap >= FEED_WINDOW_MIN ? 'fail' : gap >= STALL_WARN_MIN ? 'warn' : 'ok',
+      gap == null ? 'Not checked yet' : `${gap} min ago`);
+
+    // Readback.
+    const from = today();
+    const to = addDays(from, Math.min(Math.max(days, 1), 60) - 1);
+    const rooms = db.prepare('SELECT room_type_id, external_room_id FROM channel_room_mappings WHERE channel_id = ?').all(channel.id);
+    const minField = config.min_stay_type === 'through' ? 'min_stay_through' : 'min_stay_arrival';
+    try {
+      const [avail, restr] = await Promise.all([
+        this.client.getAvailability(config.property_id, from, to),
+        this.client.getRestrictions(config.property_id, from, to, ['rate', 'stop_sell', 'closed_to_arrival', 'closed_to_departure', minField, 'max_stay']),
+      ]);
+      const pricer = new Pricer(db);
+      const queued = db.prepare('SELECT 1 FROM sync_queue WHERE channel_id = ? AND room_type_id = ? AND date = ?');
+      let compared = 0;
+      let skipped = 0;
+      const differ = (what, date, ours, theirs) => { if (mismatches.length < 100) mismatches.push({ what, date, ours, theirs }); };
+      for (const r of rooms) {
+        for (const d of eachDate(from, to)) {
+          if (queued.get(channel.id, r.room_type_id, d)) { skipped += 1; continue; }
+          const u = channelUpdate(db, pricer, channel, r.room_type_id, d);
+          compared += 1;
+          const theirsAvail = avail[r.external_room_id]?.[d];
+          const label = db.prepare('SELECT name FROM room_types WHERE id = ?').get(r.room_type_id).name;
+          if (Number(theirsAvail) !== u.available) differ(`${label}: rooms available`, d, u.available, theirsAvail ?? 'missing');
+          for (const p of u.plans) {
+            const t = restr[p.external_rate_plan_id]?.[d];
+            const planName = `${label} · ${db.prepare('SELECT name FROM rate_plans WHERE id = ?').get(p.rate_plan_id).name}`;
+            if (!t) { differ(`${planName}: everything`, d, 'values', 'missing'); continue; }
+            if (Math.abs(Number(t.rate) - p.rate) > 0.005) differ(`${planName}: price`, d, p.rate, t.rate);
+            if (Boolean(t.stop_sell) !== p.stop_sell) differ(`${planName}: stop sell`, d, p.stop_sell, Boolean(t.stop_sell));
+            if (Boolean(t.closed_to_arrival) !== p.cta) differ(`${planName}: closed to arrival`, d, p.cta, Boolean(t.closed_to_arrival));
+            if (Boolean(t.closed_to_departure) !== p.ctd) differ(`${planName}: closed to departure`, d, p.ctd, Boolean(t.closed_to_departure));
+            if (t[minField] != null && Number(t[minField]) !== p.min_stay) differ(`${planName}: min stay`, d, p.min_stay, t[minField]);
+            if (t.max_stay != null && Number(t.max_stay) !== (p.max_stay ?? 0)) differ(`${planName}: max stay`, d, p.max_stay ?? 0, t.max_stay);
+          }
+        }
+      }
+      add('readback', `Channex holds what we sent (next ${eachDate(from, to).length} nights)`, mismatches.length ? 'fail' : 'ok',
+        mismatches.length
+          ? `${mismatches.length} difference(s). Use "Resend everything" on the Channex card, then check again.`
+          : `${compared} room-night(s) match${skipped ? `; ${skipped} still being sent were skipped` : ''}`);
+    } catch (err) {
+      add('readback', 'Channex holds what we sent', 'fail', `Could not read values back: ${err.message}`);
+    }
+    return finish();
+  }
+
+  /** Queue a full resync of one property to Channex (e.g. after the health check found differences). */
+  resync(propertyId) {
+    const channel = this.channel(propertyId);
+    if (!channel?.enabled) throw badRequest('Connect Channex first');
+    transaction(this.db, () => queueFullResync(this.db, channel.id));
+    this.onChange();
   }
 
   start() {

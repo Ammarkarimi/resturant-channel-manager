@@ -23,6 +23,7 @@ function openDb(file = ':memory:') {
       upgradeV2toV3(db);
     }
     db.exec(SCHEMA);
+    addMissingColumns(db);
     const broken = db.prepare('PRAGMA foreign_key_check').all();
     if (broken.length) throw new Error(`Database upgrade left broken references: ${JSON.stringify(broken.slice(0, 5))}`);
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
@@ -36,6 +37,20 @@ function openDb(file = ':memory:') {
     });
   }
   return db;
+}
+
+// Columns added after version 3. CREATE TABLE IF NOT EXISTS leaves existing
+// tables alone, so older databases get them here.
+const ADDED_COLUMNS = [
+  ['channels', 'last_pull_ok_at', 'TEXT'],
+  ['bookings', 'ota_reference', 'TEXT'],
+];
+
+function addMissingColumns(db) {
+  for (const [table, column, def] of ADDED_COLUMNS) {
+    const has = db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
+    if (!has) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${def}`);
+  }
 }
 
 /** Bookings taken by phone or at the desk. Never pushed anywhere itself; it only takes rooms out of what the OTAs can sell. */

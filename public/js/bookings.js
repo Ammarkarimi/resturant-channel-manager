@@ -136,7 +136,7 @@ async function loadBookings() {
   $('#bookings').innerHTML = `<thead><tr><th>Guest</th><th>From</th><th>Rooms</th><th>Stay</th><th class="num">Total</th><th>Status</th><th></th></tr></thead><tbody>${
     rows.map((b) => `<tr class="clickable" data-booking="${b.id}" tabindex="0">
         <td><strong>${esc(b.guest_name) || '<span class="muted">–</span>'}</strong>
-          <div class="muted small">${esc(b.external_ref)}${b.guest_phone ? ` · ${esc(b.guest_phone)}` : ''}</div></td>
+          <div class="muted small">${esc(b.ota_reference || b.external_ref)}${b.guest_phone ? ` · ${esc(b.guest_phone)}` : ''}</div></td>
         <td>${sourceLabel(b)}</td>
         <td>${esc(b.rooms_summary) || '<span class="muted">–</span>'}${b.rooms > 1 ? ` <span class="muted small">(${b.rooms})</span>` : ''}</td>
         <td class="nowrap">${shortDate(b.check_in)} → ${shortDate(b.check_out)}</td>
@@ -152,12 +152,13 @@ async function openBooking(id) {
   const flagged = b.status === 'confirmed' && !b.handled_at && (b.overbooked || b.needs_attention);
   const canCancel = can('bookings') && b.status === 'confirmed' && b.channel_kind !== 'channex';
   openDialog({
-    title: `${b.guest_name || 'Booking'} · ${b.external_ref}`,
+    title: `${b.guest_name || 'Booking'} · ${b.ota_reference || b.external_ref}`,
     wide: true,
     body: `
       <div class="detail">
         <div><span class="muted small">Status</span>${statusBadge(b)}</div>
         <div><span class="muted small">From</span>${sourceLabel(b)}</div>
+        ${b.ota_reference ? `<div><span class="muted small">${esc(b.source || 'OTA')} reservation no.</span><strong>${esc(b.ota_reference)}</strong></div>` : ''}
         <div><span class="muted small">Stay</span>${esc(longDate(b.check_in))} → ${esc(longDate(b.check_out))} · ${b.nights} night(s)</div>
         <div><span class="muted small">Total</span>${b.total != null ? money(b.total, b.currency || undefined, 2) : '–'}</div>
         <div><span class="muted small">Phone</span>${esc(b.guest_phone) || '–'}</div>

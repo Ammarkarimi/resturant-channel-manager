@@ -32,6 +32,7 @@
         ${b.guest_phone ? `<div><span>Phone</span>${esc(b.guest_phone)}</div>` : ''}
         ${b.guest_email ? `<div><span>Email</span>${esc(b.guest_email)}</div>` : ''}
         <div><span>Booked via</span>${esc(b.source || b.channel_name)}</div>
+        ${b.ota_reference ? `<div><span>${esc(b.source || 'OTA')} reservation no.</span>${esc(b.ota_reference)}</div>` : ''}
       </div>
       <h2>Rooms</h2>
       <table><thead><tr><th>Room</th><th>Plan</th><th>Rooms</th><th>Guests per room</th></tr></thead><tbody>

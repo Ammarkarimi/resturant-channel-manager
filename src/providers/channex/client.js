@@ -116,13 +116,34 @@ class ChannexClient {
     }
   }
 
-  /** Unacknowledged booking revisions, oldest first. */
-  async bookingFeed(propertyId) {
+  /** One page of unacknowledged booking revisions, oldest first. */
+  async bookingFeed(propertyId, page = 1) {
     const body = await this.request(
       'GET',
-      `/booking_revisions/feed?filter[property_id]=${encodeURIComponent(propertyId)}&order[inserted_at]=asc`
+      `/booking_revisions/feed?filter[property_id]=${encodeURIComponent(propertyId)}&order[inserted_at]=asc&pagination[page]=${page}`
     );
     return body?.data || [];
+  }
+
+  /** Bookings created since a moment, for recovering after an outage (paginated, every page). */
+  async listBookings(propertyId, since) {
+    return this.listAll(
+      `/bookings?filter[property_id]=${encodeURIComponent(propertyId)}&filter[inserted_at][gte]=${encodeURIComponent(since)}`
+    );
+  }
+
+  /** What Channex holds for availability: { roomTypeId: { date: count } }. */
+  async getAvailability(propertyId, from, to) {
+    const body = await this.request('GET', `/availability?filter[property_id]=${encodeURIComponent(propertyId)}`
+      + `&filter[date][gte]=${from}&filter[date][lte]=${to}`);
+    return body?.data || {};
+  }
+
+  /** What Channex holds for prices and restrictions: { ratePlanId: { date: { rate, ... } } }. */
+  async getRestrictions(propertyId, from, to, fields) {
+    const body = await this.request('GET', `/restrictions?filter[property_id]=${encodeURIComponent(propertyId)}`
+      + `&filter[date][gte]=${from}&filter[date][lte]=${to}&filter[restrictions]=${fields.join(',')}`);
+    return body?.data || {};
   }
 
   async ackRevision(revisionId) {
