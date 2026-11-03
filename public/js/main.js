@@ -163,10 +163,32 @@ async function startApp(user, properties) {
   }, POLL_MS);
 }
 
+/** Showcase: one-click demo logins on the login screen, and a banner in the app. */
+function setUpDemo(accounts) {
+  $('#demo-banner').hidden = false;
+  const box = $('#demo-logins');
+  box.hidden = false;
+  box.innerHTML = `<strong>Try the demo</strong>
+    <p class="muted small">A sample hotel group with bookings, rate plans and reports. Log in as:</p>
+    <div class="actions">${accounts.map((a, i) => `<button type="button" class="${i === 0 ? 'primary' : ''}" data-demo="${i}">${esc(a.label)}</button>`).join('')}</div>
+    <p class="muted small">${accounts.map((a) => `${esc(a.label)}: <code>${esc(a.email)}</code> / <code>${esc(a.password)}</code>`).join('<br>')}</p>`;
+  box.onclick = async (e) => {
+    const a = accounts[Number(e.target.dataset.demo)];
+    if (!a) return;
+    try {
+      const r = await api('POST', '/api/auth/login', { email: a.email, password: a.password });
+      await startApp(r.user, r.properties);
+    } catch (err) {
+      flash($('.msg', $('#login-form')), err.message, false);
+    }
+  };
+}
+
 (async function boot() {
   try {
     const s = await api('GET', '/api/session');
     state.roles = s.roles || {};
+    if (s.demo) setUpDemo(s.demo);
     if (s.needs_setup) showSetup();
     else if (!s.user) showLogin();
     else await startApp(s.user, s.properties);

@@ -3,12 +3,16 @@ const fs = require('node:fs');
 const { openDb } = require('./db');
 const { createApp } = require('./app');
 const { clientFromEnv } = require('./providers/channex/client');
+const { seedShowcase, DEMO_ACCOUNTS } = require('./demo');
 
 const PORT = Number(process.env.PORT) || 3000;
 const DB_FILE = process.env.DB_FILE || path.join(__dirname, '..', 'data', 'channel-manager.db');
+// Showcase: a ready-made demo hotel group and shared demo logins.
+const DEMO = process.env.DEMO_MODE === '1';
 
 if (DB_FILE !== ':memory:') fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
 const db = openDb(DB_FILE);
+if (DEMO) seedShowcase(db);
 const channexClient = clientFromEnv();
 const { app, engine, channex } = createApp(db, {
   channexClient,
@@ -17,12 +21,13 @@ const { app, engine, channex } = createApp(db, {
   // Behind a reverse proxy that terminates HTTPS (nginx, Caddy, a PaaS), set
   // TRUST_PROXY=1 so secure cookies and client IPs work.
   trustProxy: process.env.TRUST_PROXY ? (Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY) : false,
+  demoAccounts: DEMO ? DEMO_ACCOUNTS : null,
 });
 
 engine.start();
 channex.start();
 app.listen(PORT, () => {
-  console.log(`Channel manager running at http://localhost:${PORT}`);
+  console.log(`Channel manager running at http://localhost:${PORT}${DEMO ? ' (showcase mode)' : ''}`);
   console.log(channexClient
     ? `Channex: ${channexClient.environment} (${channexClient.baseUrl})`
     : 'Channex: not configured (set CHANNEX_API_KEY to connect real OTAs)');

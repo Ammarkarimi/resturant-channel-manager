@@ -30,7 +30,7 @@ function loginResponse(db, userId) {
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).catch(next);
 
 /** Routes that work without being logged in: first-run setup and login. */
-function publicAuthRoutes({ db }) {
+function publicAuthRoutes({ db, demoAccounts }) {
   const r = express.Router();
   const limiter = new LoginLimiter();
 
@@ -42,6 +42,8 @@ function publicAuthRoutes({ db }) {
       user: user ? publicUser(db, user.id) : null,
       properties: user ? accessibleProperties(db, user) : [],
       roles: ROLE_LABELS,
+      // Showcase mode: the shared logins, shown on the login screen.
+      demo: demoAccounts ? demoAccounts.map(({ email, password, label }) => ({ email, password, label })) : null,
     });
   });
 

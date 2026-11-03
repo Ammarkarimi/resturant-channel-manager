@@ -310,3 +310,37 @@ test('reports: KPIs, channel performance, pace, parity and CSV export', () => wi
   assert.equal((await api('GET', '/api/reports/export.csv?type=nope')).status, 400);
   assert.ok(db);
 }));
+
+// ---------- Showcase mode ----------
+
+test('showcase mode: ready-made data, shared logins, and account changes switched off', async () => {
+  const { openDb } = require('../src/db');
+  const { seedShowcase, DEMO_ACCOUNTS } = require('../src/demo');
+  const db = openDb(':memory:');
+  seedShowcase(db);
+  await withApp(async ({ client }) => {
+    const c = client();
+    const s = (await c('GET', '/api/session')).body;
+    assert.equal(s.needs_setup, false);
+    assert.deepEqual(s.demo.map((a) => a.email), DEMO_ACCOUNTS.map((a) => a.email));
+
+    const login = await c.login(s.demo[0].email, s.demo[0].password);
+    assert.deepEqual(login.body.properties.map((p) => p.name).sort(), ['Hill Lodge', 'Lakeview Residency']);
+    c.property = login.body.properties.find((p) => p.name === 'Lakeview Residency').id;
+    const dash = (await c('GET', '/api/reports/dashboard')).body;
+    assert.ok(dash.occupancy_today_pct > 20, `occupancy ${dash.occupancy_today_pct}`);
+    assert.ok(dash.recent_bookings.length > 0);
+
+    for (const [method, path, body] of [
+      ['POST', '/api/auth/password', { current_password: 'demo1234', new_password: 'hijacked1' }],
+      ['POST', '/api/auth/2fa/setup', {}],
+      ['POST', '/api/users', { name: 'X', email: 'x@x.io', password: 'whatever1' }],
+      ['DELETE', '/api/users/2'],
+      ['POST', '/api/properties', { name: 'X', currency: 'INR' }],
+    ]) {
+      assert.equal((await c(method, path, body)).status, 403, `${method} ${path}`);
+    }
+    // Everything else works.
+    assert.equal((await c('POST', '/api/inventory/bulk', { room_type_ids: [1], start_date: dash.today, end_date: dash.today, set: { cta: true } })).status, 200);
+  }, { db, demoAccounts: DEMO_ACCOUNTS }, { setup: false });
+});

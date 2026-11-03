@@ -325,3 +325,8 @@ dialog fieldset { display: grid; gap: .4rem; }
 }
 
 #provider .alert ul { margin: .35rem 0 0; padding-left: 1.2rem; font-weight: 400; }
+
+/* Showcase mode */
+.demo-box { border: 1px solid var(--accent); border-radius: 8px; padding: .75rem .9rem; display: grid; gap: .4rem; background: var(--row-head); }
+.demo-box p { margin: 0; }
+.demo-banner { margin: 0; padding: .45rem 1.25rem; background: var(--warn-bg); color: var(--warn); font-size: .85rem; text-align: center; }

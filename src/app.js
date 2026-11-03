@@ -35,18 +35,32 @@ function csrfCheck(req, res, next) {
   return res.status(403).json({ error: 'Missing request header' });
 }
 
+// In showcase mode, visitors share the demo logins: nobody may lock the
+// others out or change who has access.
+const DEMO_BLOCKED = [/^\/auth\/password$/, /^\/auth\/2fa\//, /^\/users(\/|$)/, /^\/properties$/, /^\/setup$/];
+
+function demoGuard(req, res, next) {
+  if (req.method !== 'GET' && DEMO_BLOCKED.some((re) => re.test(req.path))) {
+    return res.status(403).json({ error: 'Not available in the demo. Everything else can be tried.' });
+  }
+  return next();
+}
+
 /**
- * @param {object} opts.channexClient        ChannexClient or null
+ * @param {object} opts.channexClient       ChannexClient or null
  * @param {string} opts.channexWebhookSecret shared secret Channex sends in X-Channex-Webhook-Secret
  * @param {number} opts.channexPollMs        how often to check Channex for bookings
  * @param {*}      opts.trustProxy           Express "trust proxy" setting when behind a reverse proxy
+ * @param {Array}  opts.demoAccounts         showcase mode: logins listed on the login screen; account,
+ *                                           user and property changes are switched off
  */
 function createApp(db, {
   syncIntervalMs = 1000, channexClient = null, channexWebhookSecret = null, channexPollMs = 60_000, trustProxy = false,
+  demoAccounts = null,
 } = {}) {
   const engine = new SyncEngine(db, { intervalMs: syncIntervalMs, providers: { channex: channexClient } });
   const channex = new ChannexService(db, channexClient, { onChange: () => engine.kick(), pollMs: channexPollMs });
-  const ctx = { db, engine, channex, channexWebhookSecret };
+  const ctx = { db, engine, channex, channexWebhookSecret, demoAccounts };
 
   const app = express();
   app.disable('x-powered-by');
@@ -59,6 +73,7 @@ function createApp(db, {
   app.get('/api/health', (req, res) => res.json({ ok: true }));
   app.post('/api/providers/channex/webhook', channexWebhook(ctx));
   app.use('/api', csrfCheck);
+  if (demoAccounts) app.use('/api', demoGuard);
   app.use('/api', publicAuthRoutes(ctx));
 
   // Everything else needs a logged-in user.
