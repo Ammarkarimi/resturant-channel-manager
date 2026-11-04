@@ -344,3 +344,30 @@ test('showcase mode: ready-made data, shared logins, and account changes switche
     assert.equal((await c('POST', '/api/inventory/bulk', { room_type_ids: [1], start_date: dash.today, end_date: dash.today, set: { cta: true } })).status, 200);
   }, { db, demoAccounts: DEMO_ACCOUNTS }, { setup: false });
 });
+
+test('showcase on serverless: a session signed on one instance works on another, tampering does not', async () => {
+  const { openDb } = require('../src/db');
+  const { seedShowcase, DEMO_ACCOUNTS } = require('../src/demo');
+  const make = () => { const db = openDb(':memory:'); seedShowcase(db); return db; };
+  const opts = (db) => ({ db, demoAccounts: DEMO_ACCOUNTS, sessionSecret: 'test-secret' });
+  const a = await startApp(opts(make()), { setup: false });
+  const b = await startApp(opts(make()), { setup: false });
+  try {
+    const c = a.client();
+    const login = await c.login(DEMO_ACCOUNTS[1].email, DEMO_ACCOUNTS[1].password);
+    const cookie = login.headers.get('set-cookie').split(';')[0];
+    const get = (app, value) => fetch(`${app.base}/api/session`, { headers: { cookie: value } }).then((r) => r.json());
+
+    assert.equal((await get(b, cookie)).user.email, DEMO_ACCOUNTS[1].email);
+    // Changing the user id inside the token must not log you in as someone else.
+    const forged = cookie.replace(/v1\.(\d+)\./, (m, id) => `v1.${Number(id) === 1 ? 2 : 1}.`);
+    assert.notEqual(forged, cookie);
+    assert.equal((await get(b, forged)).user, null);
+    // Without the secret, the instance only trusts its own sessions table.
+    const plain = await startApp({ db: make(), demoAccounts: DEMO_ACCOUNTS }, { setup: false });
+    try { assert.equal((await get(plain, cookie)).user, null); } finally { await plain.close(); }
+  } finally {
+    await a.close();
+    await b.close();
+  }
+});

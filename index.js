@@ -20,6 +20,8 @@ const { app, engine } = createApp(db, {
   channexPollMs: 0,
   trustProxy: 1,
   demoAccounts: demo ? DEMO_ACCOUNTS : null,
+  // Each Vercel instance has its own in-memory copy of the demo, so sessions must be checkable anywhere.
+  sessionSecret: demo ? process.env.SESSION_SECRET || null : null,
 });
 
 engine.start();

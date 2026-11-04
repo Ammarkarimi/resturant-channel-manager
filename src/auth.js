@@ -25,20 +25,48 @@ function verifyPassword(password, stored) {
 
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 
-function createSession(db, userId) {
-  const token = crypto.randomBytes(32).toString('base64url');
+const USER_COLUMNS = 'u.id, u.email, u.name, u.role, u.all_properties, u.totp_enabled';
+const hmac = (secret, s) => crypto.createHmac('sha256', secret).update(s).digest('base64url');
+
+/**
+ * Signed tokens ("v1.<user>.<expiry>.<nonce>.<signature>") let any server instance that shares the
+ * secret check a session without the sessions table. They are only used in showcase mode on
+ * serverless hosts, where every instance has its own in-memory database and the same demo users.
+ */
+function signedToken(secret, userId, expiresMs) {
+  const body = `v1.${userId}.${expiresMs}.${crypto.randomBytes(12).toString('base64url')}`;
+  return `${body}.${hmac(secret, body)}`;
+}
+
+function signedUserId(secret, token) {
+  const parts = token.split('.');
+  if (parts.length !== 5 || parts[0] !== 'v1') return null;
+  const expected = Buffer.from(hmac(secret, parts.slice(0, 4).join('.')));
+  const actual = Buffer.from(parts[4]);
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) return null;
+  if (!(Number(parts[2]) > Date.now())) return null;
+  const id = Number(parts[1]);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+function createSession(db, userId, secret = null) {
   const now = new Date();
   const expires = new Date(now.getTime() + SESSION_DAYS * 86_400_000);
+  const token = secret ? signedToken(secret, userId, expires.getTime()) : crypto.randomBytes(32).toString('base64url');
   db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now.toISOString());
   db.prepare('INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)')
     .run(sha256(token), userId, now.toISOString(), expires.toISOString());
   return { token, maxAge: SESSION_DAYS * 86_400_000 };
 }
 
-function sessionUser(db, token) {
+function sessionUser(db, token, secret = null) {
   if (!token) return null;
+  if (secret) {
+    const id = signedUserId(secret, token);
+    return id ? db.prepare(`SELECT ${USER_COLUMNS} FROM users u WHERE u.id = ?`).get(id) || null : null;
+  }
   return db.prepare(`
-    SELECT u.id, u.email, u.name, u.role, u.all_properties, u.totp_enabled FROM sessions s JOIN users u ON u.id = s.user_id
+    SELECT ${USER_COLUMNS} FROM sessions s JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = ? AND s.expires_at > ?
   `).get(sha256(token), new Date().toISOString()) || null;
 }

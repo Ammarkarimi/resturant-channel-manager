@@ -328,6 +328,28 @@ hotel.example.com {
 | `CHANNEX_ENV` | `staging` | `staging` or `production` |
 | `CHANNEX_WEBHOOK_SECRET` | – | Shared secret for the Channex webhook (optional) |
 | `CHANNEX_POLL_SECONDS` | `60` | How often to check Channex for bookings |
+| `DEMO_MODE` | off | `1` = showcase: a ready-made demo hotel group and shared logins; account, user and property changes are switched off |
+
+### A public showcase on Vercel
+
+Vercel can host a **showcase only**, not a real hotel: its functions have no
+lasting disk and cron jobs run at most once a day on the free plan. `index.js`
+is the Vercel entry point. It keeps the database in memory and, with
+`DEMO_MODE=1`, every new instance builds the same demo (two properties,
+about a year of bookings, demo OTAs) with one-click logins on the login screen.
+
+Project settings: framework **Express**, Node **22.x**, and these variables:
+
+| Variable | Value |
+|---|---|
+| `DEMO_MODE` | `1` |
+| `SESSION_SECRET` | a long random string, marked Sensitive |
+
+Vercel runs several instances. `SESSION_SECRET` signs login cookies so every
+instance accepts them; without it, visitors get logged out at random. Changes
+a visitor makes are kept only by the instance that served them and are lost
+when it shuts down, which is fine for a demo. For a real hotel, use Docker or
+a server with a persistent disk, as described above.
 
 ## Security
 

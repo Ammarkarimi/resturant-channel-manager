@@ -17,8 +17,8 @@ const MAX_CODE_ATTEMPTS = 5;
 
 const needsSetup = (db) => db.prepare('SELECT COUNT(*) AS n FROM users').get().n === 0;
 
-function startSession(db, req, res, userId) {
-  const { token, maxAge } = createSession(db, userId);
+function startSession(db, req, res, userId, secret) {
+  const { token, maxAge } = createSession(db, userId, secret);
   res.cookie(COOKIE, token, cookieOptions(req, maxAge));
 }
 
@@ -30,13 +30,13 @@ function loginResponse(db, userId) {
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).catch(next);
 
 /** Routes that work without being logged in: first-run setup and login. */
-function publicAuthRoutes({ db, demoAccounts }) {
+function publicAuthRoutes({ db, demoAccounts, sessionSecret }) {
   const r = express.Router();
   const limiter = new LoginLimiter();
 
   // Tells the dashboard which screen to show: setup, login or the app.
   r.get('/session', (req, res) => {
-    const user = sessionUser(db, readCookie(req));
+    const user = sessionUser(db, readCookie(req), sessionSecret);
     res.json({
       needs_setup: needsSetup(db),
       user: user ? publicUser(db, user.id) : null,
@@ -68,7 +68,7 @@ function publicAuthRoutes({ db, demoAccounts }) {
       logActivity(db, created, `Set up ${property.name}${body.demo ? ' with demo rooms, rate plans and OTAs' : ''}`, propertyId);
       return created;
     });
-    startSession(db, req, res, user.id);
+    startSession(db, req, res, user.id, sessionSecret);
     res.status(201).json(loginResponse(db, user.id));
   });
 
@@ -91,7 +91,7 @@ function publicAuthRoutes({ db, demoAccounts }) {
         .run(sha256(challenge), row.id, new Date(Date.now() + CHALLENGE_MINUTES * 60_000).toISOString());
       return res.json({ two_factor_required: true, challenge });
     }
-    startSession(db, req, res, row.id);
+    startSession(db, req, res, row.id, sessionSecret);
     return res.json(loginResponse(db, row.id));
   });
 
@@ -108,7 +108,7 @@ function publicAuthRoutes({ db, demoAccounts }) {
       throw new HttpError(401, 'That code is not right. Check the time on your phone and try again.');
     }
     db.prepare('DELETE FROM login_challenges WHERE token_hash = ?').run(hash);
-    startSession(db, req, res, user.id);
+    startSession(db, req, res, user.id, sessionSecret);
     res.json(loginResponse(db, user.id));
   });
 
@@ -228,9 +228,9 @@ function userRoutes({ db }) {
 }
 
 /** Rejects API calls without a valid session and sets req.user. */
-function requireUser({ db }) {
+function requireUser({ db, sessionSecret }) {
   return (req, res, next) => {
-    const user = sessionUser(db, readCookie(req));
+    const user = sessionUser(db, readCookie(req), sessionSecret);
     if (!user) return res.status(401).json({ error: 'Please log in' });
     req.user = user;
     return next();

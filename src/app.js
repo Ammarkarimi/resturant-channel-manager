@@ -53,14 +53,16 @@ function demoGuard(req, res, next) {
  * @param {*}      opts.trustProxy           Express "trust proxy" setting when behind a reverse proxy
  * @param {Array}  opts.demoAccounts         showcase mode: logins listed on the login screen; account,
  *                                           user and property changes are switched off
+ * @param {string} opts.sessionSecret        sign session cookies with this secret so any instance sharing it
+ *                                           accepts them (showcase mode on serverless hosts only)
  */
 function createApp(db, {
   syncIntervalMs = 1000, channexClient = null, channexWebhookSecret = null, channexPollMs = 60_000, trustProxy = false,
-  demoAccounts = null,
+  demoAccounts = null, sessionSecret = null,
 } = {}) {
   const engine = new SyncEngine(db, { intervalMs: syncIntervalMs, providers: { channex: channexClient } });
   const channex = new ChannexService(db, channexClient, { onChange: () => engine.kick(), pollMs: channexPollMs });
-  const ctx = { db, engine, channex, channexWebhookSecret, demoAccounts };
+  const ctx = { db, engine, channex, channexWebhookSecret, demoAccounts, sessionSecret };
 
   const app = express();
   app.disable('x-powered-by');
