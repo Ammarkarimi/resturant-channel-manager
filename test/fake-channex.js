@@ -30,14 +30,16 @@ function fakeChannex() {
     return { data: items.slice((p - 1) * 2, p * 2), meta: { page: p, limit: 2, total: items.length } };
   };
   const rt = (id, title, count) => ({ type: 'room_type', id, attributes: { id, title, count_of_rooms: count } });
-  const rp = (id, title, roomTypeId, sellMode = 'per_room') => ({
+  const rp = (id, title, roomTypeId, sellMode = 'per_room', rateMode = 'manual') => ({
     type: 'rate_plan', id,
-    attributes: { id, title, sell_mode: sellMode, rate_mode: 'manual', currency: 'INR' },
+    attributes: { id, title, sell_mode: sellMode, rate_mode: rateMode, currency: 'INR' },
     relationships: { room_type: { data: { id: roomTypeId, type: 'room_type' } } },
   });
   const roomTypes = [rt('rt-dlx', 'Deluxe', 10), rt('rt-exe', 'Executive', 6), rt('rt-ste', 'Suite', 2)];
   const ratePlans = [rp('rp-dlx', 'Deluxe BAR', 'rt-dlx'), rp('rp-exe', 'Exec BAR', 'rt-exe'),
-    rp('rp-ste', 'Suite BAR', 'rt-ste'), rp('rp-ste-pp', 'Suite per person', 'rt-ste', 'per_person')];
+    rp('rp-ste', 'Suite BAR', 'rt-ste'), rp('rp-ste-pp', 'Suite per person', 'rt-ste', 'per_person'),
+    // Channex's own demo plans are per room with rate_mode "auto"; derived plans take a parent's price.
+    rp('rp-ste-auto', 'Suite auto', 'rt-ste', 'per_room', 'auto'), rp('rp-ste-der', 'Suite derived', 'rt-ste', 'per_room', 'derived')];
 
   app.get('/api/v1/properties/options', (req, res) => res.json({
     data: [{ type: 'property', id: 'prop-1', attributes: { id: 'prop-1', title: 'Test Hotel', currency: 'INR', min_stay_type: 'arrival' } }],
@@ -90,9 +92,17 @@ function fakeChannex() {
     const { gte, lte } = req.query.filter.date;
     const fields = req.query.filter.restrictions.split(',');
     const out = {};
+    // Like the real Channex: what we set comes back as stop_sell_manual, while stop_sell is
+    // computed and is also true on nights the room type has no availability left.
+    const roomOf = Object.fromEntries(ratePlans.map((p) => [p.id, p.relationships.room_type.data.id]));
+    const read = (planId, d, cell, f) => {
+      if (f === 'stop_sell_manual') return cell.stop_sell ?? null;
+      if (f === 'stop_sell') return Boolean(cell.stop_sell) || state.availability[roomOf[planId]]?.[d] === 0;
+      return cell[f] ?? null;
+    };
     for (const [planId, days] of Object.entries(state.restrictions)) {
       out[planId] = Object.fromEntries(Object.entries(days).filter(([d]) => d >= gte && d <= lte)
-        .map(([d, cell]) => [d, Object.fromEntries(fields.map((f) => [f, cell[f] ?? null]))]));
+        .map(([d, cell]) => [d, Object.fromEntries(fields.map((f) => [f, read(planId, d, cell, f)]))]));
     }
     res.json({ data: out });
   });

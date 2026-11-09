@@ -77,7 +77,7 @@ test('lists Channex properties and rooms (across pages), flagging unusable rate 
   assert.deepEqual(props.body.map((p) => p.id), ['prop-1']);
   const rooms = await api('GET', '/api/providers/channex/properties/prop-1/rooms');
   assert.equal(rooms.body.room_types.length, 3);
-  assert.equal(rooms.body.rate_plans.length, 4);
+  assert.equal(rooms.body.rate_plans.length, 6);
   assert.equal(rooms.body.rate_plans.find((p) => p.id === 'rp-ste-pp').usable, false);
 });
 
@@ -254,6 +254,10 @@ test('rejects mappings Channex could not price', async () => {
   const bad = async (body) => (await api('POST', '/api/providers/channex/connect', { ...CONNECT, ...body })).body.error;
   const ste = { rooms: [{ room_type_id: 3, channex_room_type_id: 'rt-ste' }] };
   assert.match(await bad({ ...ste, rate_plans: [{ rate_plan_id: 5, channex_rate_plan_id: 'rp-ste-pp' }] }), /per_person/);
+  assert.match(await bad({ ...ste, rate_plans: [{ rate_plan_id: 5, channex_rate_plan_id: 'rp-ste-der' }] }), /per_room\/derived/);
+  const plans = (await api('GET', '/api/providers/channex/properties/prop-1/rooms')).body.rate_plans;
+  assert.deepEqual(plans.filter((p) => p.room_type_id === 'rt-ste').map((p) => [p.id, p.usable]),
+    [['rp-ste', true], ['rp-ste-pp', false], ['rp-ste-auto', true], ['rp-ste-der', false]]);
   assert.match(await bad({ ...ste, rate_plans: [{ rate_plan_id: 5, channex_rate_plan_id: 'rp-dlx' }] }), /different room type/);
   assert.match(await bad({ ...ste, rate_plans: [{ rate_plan_id: 1, channex_rate_plan_id: 'rp-dlx' }] }), /Map the room type/);
   assert.match(await bad({
@@ -363,6 +367,13 @@ test('health check reads values back from Channex and spots differences', async 
   assert.equal(byKey.readback.status, 'ok');
   assert.match(byKey.readback.detail, /21 room-night\(s\) match/);
   assert.equal(byKey.mapping.status, 'warn', 'demo plans 2, 4 and 6 are not mapped');
+
+  // A sold-out night: Channex then reports stop_sell on its own, which is not a difference.
+  await api('POST', '/api/inventory/bulk', { room_type_ids: [3], start_date: D0, end_date: D0, set: { available: 0 } });
+  await sleep(220);
+  await drain();
+  r = (await api('GET', '/api/providers/channex/doctor?days=7')).body;
+  assert.equal(r.ok, true, JSON.stringify(r.mismatches));
 
   // Someone changed a price inside Channex.
   fake.state.restrictions['rp-dlx'][D0].rate = '1.00';

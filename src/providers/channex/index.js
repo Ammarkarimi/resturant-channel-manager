@@ -6,6 +6,8 @@ const { channelUpdate } = require('../../sync');
 const { Pricer } = require('../../pricing');
 const { addDays, today, eachDate } = require('../../dates');
 
+const SETTABLE_RATE_MODES = new Set(['manual', 'auto']);
+
 const CODE = 'channex';
 const MAX_FEED_PAGES = 50; // safety stop: 50 pages x 10 revisions per pull
 // Channex re-sends an unacknowledged booking for about 30 minutes, then it
@@ -92,8 +94,10 @@ class ChannexService {
       room_types: roomTypes,
       rate_plans: ratePlans.map((rp) => ({
         ...rp,
-        // We send one price per night, which needs a manually priced per-room plan.
-        usable: rp.sell_mode === 'per_room' && rp.rate_mode === 'manual',
+        // We send one price per night for the plan's main occupancy. That works for per-room plans priced
+        // manually, or "auto" (Channex works out other occupancies from it). Derived and cascade plans
+        // take their price from a parent plan, so a price we send would not be used.
+        usable: rp.sell_mode === 'per_room' && SETTABLE_RATE_MODES.has(rp.rate_mode),
       })),
     };
   }
@@ -142,7 +146,7 @@ class ChannexService {
       if (!theirs) throw badRequest(`Channex rate plan ${m.channex_rate_plan_id} is not in this property`);
       if (theirs.room_type_id !== roomMap.get(ours.room_type_id)) throw badRequest(`Rate plan "${theirs.title}" belongs to a different room type`);
       if (!theirs.usable) {
-        throw badRequest(`Rate plan "${theirs.title}" is ${theirs.sell_mode}/${theirs.rate_mode}; only manual per-room plans are supported`);
+        throw badRequest(`Rate plan "${theirs.title}" is ${theirs.sell_mode}/${theirs.rate_mode}; only per-room plans priced manually or automatically (from the main occupancy) are supported`);
       }
       if ([...planMap.values()].includes(theirs.id)) throw badRequest('Two rate plans are mapped to the same Channex rate plan');
       planMap.set(ours.id, theirs.id);
@@ -405,7 +409,7 @@ class ChannexService {
     try {
       const [avail, restr] = await Promise.all([
         this.client.getAvailability(config.property_id, from, to),
-        this.client.getRestrictions(config.property_id, from, to, ['rate', 'stop_sell', 'closed_to_arrival', 'closed_to_departure', minField, 'max_stay']),
+        this.client.getRestrictions(config.property_id, from, to, ['rate', 'stop_sell_manual', 'closed_to_arrival', 'closed_to_departure', minField, 'max_stay']),
       ]);
       const pricer = new Pricer(db);
       const queued = db.prepare('SELECT 1 FROM sync_queue WHERE channel_id = ? AND room_type_id = ? AND date = ?');
@@ -425,7 +429,8 @@ class ChannexService {
             const planName = `${label} · ${db.prepare('SELECT name FROM rate_plans WHERE id = ?').get(p.rate_plan_id).name}`;
             if (!t) { differ(`${planName}: everything`, d, 'values', 'missing'); continue; }
             if (Math.abs(Number(t.rate) - p.rate) > 0.005) differ(`${planName}: price`, d, p.rate, t.rate);
-            if (Boolean(t.stop_sell) !== p.stop_sell) differ(`${planName}: stop sell`, d, p.stop_sell, Boolean(t.stop_sell));
+            // Channex's own stop_sell is also true whenever the room is sold out; the flag we set is stop_sell_manual.
+            if (Boolean(t.stop_sell_manual) !== p.stop_sell) differ(`${planName}: stop sell`, d, p.stop_sell, Boolean(t.stop_sell_manual));
             if (Boolean(t.closed_to_arrival) !== p.cta) differ(`${planName}: closed to arrival`, d, p.cta, Boolean(t.closed_to_arrival));
             if (Boolean(t.closed_to_departure) !== p.ctd) differ(`${planName}: closed to departure`, d, p.ctd, Boolean(t.closed_to_departure));
             if (t[minField] != null && Number(t[minField]) !== p.min_stay) differ(`${planName}: min stay`, d, p.min_stay, t[minField]);

@@ -186,8 +186,10 @@ to Channex:
 
 1. **Get a Channex account.** The sandbox at `staging.channex.io` is free.
    Create your property there, with its room types and rate plans. Use
-   *per room* rate plans with *manual* pricing, because the app sends one
-   price per night.
+   *per room* rate plans priced *manually* or *automatically* (Channex's
+   `auto` mode), because the app sends one price per night for the main
+   occupancy. Derived and cascade plans take their price from a parent plan
+   and can't be mapped.
 2. **Create an API key** in Channex (profile → *API Access*).
 3. **Configure the app:** copy `.env.example` to `.env` and set
    `CHANNEX_API_KEY` (and `CHANNEX_ENV=production` when you go live).
